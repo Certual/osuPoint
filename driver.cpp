@@ -22,23 +22,21 @@
 
 constexpr double PI = 3.14159265358979323846;
 
-// Active tablet hardware specifications
 struct TabletSpec {
     std::string name = "Wacom One CTL-472";
     USHORT vid = 0x056A;
     USHORT pid = 0x037A;
     int max_x = 15200;
     int max_y = 9500;
-    double phys_w = 152.0; // mm
-    double phys_h = 95.0;  // mm
+    double phys_w = 152.0;
+    double phys_h = 95.0;
     int report_len = 10;
     int report_id = 0x02;
     int x_offset = 2;
     int y_offset = 4;
-    std::vector<BYTE> init_feature{ 0x02, 0x02 }; // Feature report command to switch to digitizer mode
+    std::vector<BYTE> init_feature{ 0x02, 0x02 };
 } g_spec;
 
-// Precomputed scale multipliers (hardware ticks -> mm)
 double g_inv_scale_x = 152.0 / 15200.0;
 double g_inv_scale_y = 95.0 / 9500.0;
 
@@ -275,7 +273,6 @@ void LoadConfig() {
     }
 }
 
-// Low-latency input pipeline
 void DriverThread() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     SetThreadAffinityMask(GetCurrentThread(), (1ULL << 2));
@@ -308,9 +305,6 @@ void DriverThread() {
         HidD_SetFeature(g_hDevice, g_spec.init_feature.data(), static_cast<ULONG>(g_spec.init_feature.size()));
     }
 
-    int screen_w = GetSystemMetrics(SM_CXSCREEN);
-    int screen_h = GetSystemMetrics(SM_CYSCREEN);
-
     BYTE report[64];
     DWORD bytesRead = 0;
 
@@ -319,6 +313,10 @@ void DriverThread() {
     const int req_id = g_spec.report_id;
     const int max_x = g_spec.max_x;
     const int max_y = g_spec.max_y;
+
+    INPUT mouseInput = { 0 };
+    mouseInput.type = INPUT_MOUSE;
+    mouseInput.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
 
     while (g_running) {
         if (ReadFile(g_hDevice, report, sizeof(report), &bytesRead, nullptr) && bytesRead > 0) {
@@ -345,7 +343,6 @@ void DriverThread() {
             double cos_r = g_cfg.cos_val.load(std::memory_order_relaxed);
             double sin_r = g_cfg.sin_val.load(std::memory_order_relaxed);
 
-            // Inverse rotation into area local coordinates
             double dx = px - cx;
             double dy = py - cy;
             double lx = dx * cos_r - dy * sin_r;
@@ -354,15 +351,15 @@ void DriverThread() {
             double half_w = w * 0.5;
             double half_h = h * 0.5;
 
-            // Clamp within local bounds
             double cl_x = (std::max)(-half_w, (std::min)(half_w, lx));
             double cl_y = (std::max)(-half_h, (std::min)(half_h, ly));
 
-            // Map directly to screen coordinates
-            int target_x = static_cast<int>(((cl_x + half_w) / w) * screen_w);
-            int target_y = static_cast<int>(((cl_y + half_h) / h) * screen_h);
+            // Direct mapping to Windows Absolute Mouse space (0 - 65535)
+            // Emits true 1000Hz hardware-equivalent mouse packets
+            mouseInput.mi.dx = static_cast<LONG>(((cl_x + half_w) / w) * 65535.0);
+            mouseInput.mi.dy = static_cast<LONG>(((cl_y + half_h) / h) * 65535.0);
 
-            SetCursorPos(target_x, target_y);
+            SendInput(1, &mouseInput, sizeof(INPUT));
         }
     }
 }
@@ -401,7 +398,6 @@ void UpdateValues() {
     w = (std::max)(2.0, (std::min)(g_spec.phys_w, w));
     h = (std::max)(2.0, (std::min)(g_spec.phys_h, h));
 
-    // Compute bounding box under rotation
     double rad = rot_deg * (PI / 180.0);
     double c = std::abs(std::cos(rad));
     double s = std::abs(std::sin(rad));
@@ -422,7 +418,6 @@ void UpdateValues() {
         bbox_w *= sc;
     }
 
-    // Physical tablet boundary clamping
     double half_box_w = bbox_w * 0.5;
     double half_box_h = bbox_h * 0.5;
 
@@ -493,7 +488,6 @@ void DrawPreview(HDC hdc) {
         pts[i].y = box_y + static_cast<int>(ry * scale);
     }
 
-    // Clip rendering strictly to tablet boundaries
     HRGN clipRgn = CreateRectRgn(box_x, box_y, box_x + tab_w, box_y + tab_h);
     SelectClipRgn(hdc, clipRgn);
 

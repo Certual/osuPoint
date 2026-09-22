@@ -23,8 +23,8 @@ Most osu! players rely on OpenTabletDriver (OTD). While OTD is a great project w
 | **Garbage Collector (GC)** | None | Yes (.NET GC) | **None (Zero allocations)** |
 | **Software Pipeline Latency** | 4–15 ms (smoothing filters) | 0.5–1.5 ms | **< 50 nanoseconds** |
 | **Memory Allocations per Packet** | Yes | Yes | **0 bytes (pure registers)** |
-| **RAM Usage** | ~200 MB | ~80 MB | **< 2 MB** |
-| **Binary Size** | ~150 MB | ~45 MB | **~120 KB (standalone .exe)** |
+| **RAM Usage** | ~200 MB | ~80 MB | **< 2.5 MB** |
+| **Binary Size** | ~150 MB | ~45 MB | **~300 KB (standalone .exe)** |
 | **Driver / Kernel Cert Required** | Yes | Yes (for VMulti output) | **None (User-Mode Win32)** |
 
 ---
@@ -35,11 +35,12 @@ Most osu! players rely on OpenTabletDriver (OTD). While OTD is a great project w
 * **Precalculated Inverse Rotation:** Supports arbitrary rotation angles with decimal precision (e.g. `-3°` or `14.5°`). Trigonometric functions (`sin`/`cos`) are precomputed only when settings change; the game loop executes only fast additions and multiplications.
 * **Familiar Coordinate System:** Active areas are defined by Width, Height, Center X, and Center Y in millimeters, identical to OpenTabletDriver.
 * **Hardware Boundary Clamping:** The active area is mathematically constrained inside the physical tablet dimensions, preventing the cursor box from leaving the usable surface even under extreme rotation.
-* **Live Visual Preview:** Displays the rotated area polygon inside a hardware-clipped GDI canvas that prevents visual artifacts.
+* **Modern Dark UI:** Includes a native Windows 10/11 dark title bar (`DWMWA_USE_IMMERSIVE_DARK_MODE`), Segoe UI typography, and a realistic tablet bezel preview that prevents border clipping at Full Area.
+* **Procedural 32-bit Transparent Icon:** Dynamically generates an anti-aliased alpha-blended badge directly in memory—no external `.ico` files or taskbar background boxes.
 * **Modular Tablet Profiles:** Support for any tablet model can be added via plain text `.cfg` files inside the `tablets/` directory without recompiling.
 * **Thread Affinity & Priority:** The USB polling thread is isolated onto a dedicated physical CPU core (`Core 2`) and elevated to `THREAD_PRIORITY_TIME_CRITICAL`.
 * **High-Resolution System Timers:** Automatically enforces a 1 ms Windows timer period (`timeBeginPeriod(1)`) to eliminate OS thread scheduler jitter.
-* **Auto-Recovery & Persistence:** Settings are auto-saved to `config.ini` in the executable folder. Corrupted or missing configs self-heal to full area defaults.
+* **Auto-Recovery & Persistence:** Settings are auto-saved to `config.ini` in the executable folder. Corrupted or missing configs self-heal to full-area factory defaults.
 
 ---
 
@@ -56,7 +57,7 @@ cd C:\path\to\osuPoint
 ```cmd
 cl /O2 /Oi /Ot /GL /std:c++20 driver.cpp /link /SUBSYSTEM:WINDOWS
 ```
-4. A standalone `driver.exe` (~120 KB) will be generated.
+4. A standalone `driver.exe` (~130 KB) will be generated.
 
 ---
 

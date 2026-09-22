@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <timeapi.h>
+#include <dwmapi.h>
+#include <shellapi.h>
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <hidpi.h>
@@ -19,8 +21,23 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
 
 constexpr double PI = 3.14159265358979323846;
+constexpr UINT WM_TRAYICON = WM_USER + 1;
+constexpr UINT IDM_TRAY_OPEN = 2001;
+constexpr UINT IDM_TRAY_EXIT = 2002;
+
+const COLORREF COLOR_BG         = RGB(20, 20, 24);
+const COLORREF COLOR_CARD       = RGB(28, 28, 34);
+const COLORREF COLOR_EDIT_BG    = RGB(36, 36, 44);
+const COLORREF COLOR_TEXT       = RGB(230, 230, 235);
+const COLORREF COLOR_TEXT_MUTED = RGB(140, 140, 155);
+const COLORREF COLOR_ACCENT     = RGB(255, 102, 170); // osu! Pink
+const COLORREF COLOR_BTN        = RGB(38, 38, 48);
+const COLORREF COLOR_BTN_HOVER  = RGB(52, 52, 66);
+const COLORREF COLOR_BORDER     = RGB(55, 55, 68);
 
 struct TabletSpec {
     std::string name = "Wacom One CTL-472";
@@ -56,6 +73,11 @@ HANDLE g_hDevice = INVALID_HANDLE_VALUE;
 HWND g_hwnd = NULL;
 bool g_guiReady = false;
 std::string g_baseDir = "";
+
+HFONT g_hFont = NULL;
+HBRUSH g_hBrushBg = NULL;
+HBRUSH g_hBrushEdit = NULL;
+NOTIFYICONDATAA g_nid = { 0 };
 
 std::string GetExeDirectory() {
     char exePath[MAX_PATH];
@@ -286,6 +308,9 @@ void DriverThread() {
     if (g_hwnd) {
         std::string title = "osu!Point - [" + g_spec.name + "]";
         SetWindowTextA(g_hwnd, title.c_str());
+
+        strncpy_s(g_nid.szTip, title.c_str(), sizeof(g_nid.szTip) - 1);
+        Shell_NotifyIconA(NIM_MODIFY, &g_nid);
     }
 
     g_hDevice = CreateFileA(devPath.c_str(), GENERIC_READ | GENERIC_WRITE, 
@@ -354,8 +379,6 @@ void DriverThread() {
             double cl_x = (std::max)(-half_w, (std::min)(half_w, lx));
             double cl_y = (std::max)(-half_h, (std::min)(half_h, ly));
 
-            // Direct mapping to Windows Absolute Mouse space (0 - 65535)
-            // Emits true 1000Hz hardware-equivalent mouse packets
             mouseInput.mi.dx = static_cast<LONG>(((cl_x + half_w) / w) * 65535.0);
             mouseInput.mi.dy = static_cast<LONG>(((cl_y + half_h) / h) * 65535.0);
 
@@ -438,26 +461,96 @@ void UpdateValues() {
     if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
+HICON CreateAppIcon() {
+    constexpr int size = 32;
+    BITMAPINFO bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = -size;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    DWORD* pPixels = nullptr;
+    HBITMAP hbmColor = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, (void**)&pPixels, NULL, 0);
+    if (!hbmColor || !pPixels) return NULL;
+
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            float r_sum = 0, g_sum = 0, b_sum = 0, a_sum = 0;
+            for (int sy = 0; sy < 4; ++sy) {
+                for (int sx = 0; sx < 4; ++sx) {
+                    float px = x + (sx + 0.5f) / 4.0f - 15.5f;
+                    float py = y + (sy + 0.5f) / 4.0f - 15.5f;
+                    float d = std::sqrt(px * px + py * py);
+
+                    if (d <= 3.2f) {
+                        r_sum += 255; g_sum += 255; b_sum += 255; a_sum += 255;
+                    } else if (d <= 7.0f) {
+                        r_sum += 28; g_sum += 28; b_sum += 34; a_sum += 255;
+                    } else if (d <= 14.5f) {
+                        r_sum += 255; g_sum += 102; b_sum += 170; a_sum += 255;
+                    }
+                }
+            }
+
+            BYTE a = static_cast<BYTE>(a_sum / 16.0f);
+            BYTE r = static_cast<BYTE>(r_sum / 16.0f);
+            BYTE g = static_cast<BYTE>(g_sum / 16.0f);
+            BYTE b = static_cast<BYTE>(b_sum / 16.0f);
+
+            r = static_cast<BYTE>((r * a) / 255);
+            g = static_cast<BYTE>((g * a) / 255);
+            b = static_cast<BYTE>((b * a) / 255);
+
+            pPixels[y * size + x] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+
+    HBITMAP hbmMask = CreateBitmap(size, size, 1, 1, NULL);
+
+    ICONINFO ii = { 0 };
+    ii.fIcon = TRUE;
+    ii.hbmMask = hbmMask;
+    ii.hbmColor = hbmColor;
+    HICON hIcon = CreateIconIndirect(&ii);
+
+    DeleteObject(hbmColor);
+    DeleteObject(hbmMask);
+    return hIcon;
+}
+
 void DrawPreview(HDC hdc) {
-    int box_x = 225, box_y = 15;
-    int max_draw_w = 200;
-    int max_draw_h = 135;
+    const int box_x = 225, box_y = 15;
+    const int max_draw_w = 210;
+    const int max_draw_h = 138;
+    const int BEZEL = 7;
 
-    double scale = (std::min)(static_cast<double>(max_draw_w) / g_spec.phys_w, 
-                              static_cast<double>(max_draw_h) / g_spec.phys_h);
+    int active_max_w = max_draw_w - 2 * BEZEL;
+    int active_max_h = max_draw_h - 2 * BEZEL;
 
-    int tab_w = static_cast<int>(g_spec.phys_w * scale);
-    int tab_h = static_cast<int>(g_spec.phys_h * scale);
+    double scale = (std::min)(static_cast<double>(active_max_w) / g_spec.phys_w, 
+                              static_cast<double>(active_max_h) / g_spec.phys_h);
 
-    HBRUSH bgBrush = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
-    RECT clearRect = { box_x - 5, box_y - 5, box_x + max_draw_w + 10, box_y + max_draw_h + 10 };
-    FillRect(hdc, &clearRect, bgBrush);
-    DeleteObject(bgBrush);
+    int active_w = static_cast<int>(std::round(g_spec.phys_w * scale));
+    int active_h = static_cast<int>(std::round(g_spec.phys_h * scale));
 
-    HBRUSH tabBrush = CreateSolidBrush(RGB(40, 40, 40));
-    RECT tabRect = { box_x, box_y, box_x + tab_w, box_y + tab_h };
-    FillRect(hdc, &tabRect, tabBrush);
+    int tab_w = active_w + 2 * BEZEL;
+    int tab_h = active_h + 2 * BEZEL;
+
+    HBRUSH cardBrush = CreateSolidBrush(COLOR_CARD);
+    HPEN borderPen = CreatePen(PS_SOLID, 1, COLOR_BORDER);
+    HGDIOBJ oldBrush = SelectObject(hdc, cardBrush);
+    HGDIOBJ oldPen = SelectObject(hdc, borderPen);
+    RoundRect(hdc, box_x - 5, box_y - 5, box_x + tab_w + 5, box_y + tab_h + 5, 8, 8);
+
+    HBRUSH tabBrush = CreateSolidBrush(RGB(34, 34, 42));
+    SelectObject(hdc, tabBrush);
+    RoundRect(hdc, box_x, box_y, box_x + tab_w, box_y + tab_h, 6, 6);
     DeleteObject(tabBrush);
+
+    int origin_x = box_x + BEZEL;
+    int origin_y = box_y + BEZEL;
 
     double cx = g_cfg.center_x_mm.load(std::memory_order_relaxed);
     double cy = g_cfg.center_y_mm.load(std::memory_order_relaxed);
@@ -483,28 +576,37 @@ void DrawPreview(HDC hdc) {
     for (int i = 0; i < 4; ++i) {
         double rx = cx + (local_corners[i][0] * c - local_corners[i][1] * s);
         double ry = cy + (local_corners[i][0] * s + local_corners[i][1] * c);
-
-        pts[i].x = box_x + static_cast<int>(rx * scale);
-        pts[i].y = box_y + static_cast<int>(ry * scale);
+        pts[i].x = origin_x + static_cast<int>(std::round(rx * scale));
+        pts[i].y = origin_y + static_cast<int>(std::round(ry * scale));
     }
 
-    HRGN clipRgn = CreateRectRgn(box_x, box_y, box_x + tab_w, box_y + tab_h);
+    HRGN clipRgn = CreateRectRgn(origin_x - 2, origin_y - 2, origin_x + active_w + 3, origin_y + active_h + 3);
     SelectClipRgn(hdc, clipRgn);
 
-    HBRUSH areaBrush = CreateSolidBrush(RGB(0, 140, 255));
-    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
-    HGDIOBJ oldBrush = SelectObject(hdc, areaBrush);
-    HGDIOBJ oldPen = SelectObject(hdc, borderPen);
+    HBRUSH areaBrush = CreateSolidBrush(COLOR_ACCENT);
+    HPEN areaPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+    SelectObject(hdc, areaBrush);
+    SelectObject(hdc, areaPen);
 
     Polygon(hdc, pts, 4);
 
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(areaBrush);
-    DeleteObject(borderPen);
+    int center_px_x = origin_x + static_cast<int>(std::round(cx * scale));
+    int center_px_y = origin_y + static_cast<int>(std::round(cy * scale));
+    HBRUSH dotBrush = CreateSolidBrush(RGB(255, 255, 255));
+    SelectObject(hdc, dotBrush);
+    SelectObject(hdc, GetStockObject(NULL_PEN));
+    Ellipse(hdc, center_px_x - 2, center_px_y - 2, center_px_x + 3, center_px_y + 3);
+    DeleteObject(dotBrush);
 
     SelectClipRgn(hdc, NULL);
     DeleteObject(clipRgn);
+
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(cardBrush);
+    DeleteObject(borderPen);
+    DeleteObject(areaBrush);
+    DeleteObject(areaPen);
 }
 
 void ResetToFullArea() {
@@ -517,10 +619,22 @@ void ResetToFullArea() {
     UpdateValues();
 }
 
+void RestoreWindow(HWND hwnd) {
+    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+}
+
 void KillProcessNow() {
     g_running = false;
     timeEndPeriod(1);
     SaveConfig();
+    
+    if (g_nid.hWnd) {
+        Shell_NotifyIconA(NIM_DELETE, &g_nid);
+        g_nid.hWnd = NULL;
+    }
+
     if (g_hDevice != INVALID_HANDLE_VALUE) {
         CancelIoEx(g_hDevice, nullptr);
         CloseHandle(g_hDevice);
@@ -530,12 +644,82 @@ void KillProcessNow() {
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_SYSCOMMAND && (wParam & 0xFFF0) == SC_MINIMIZE) {
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    if (msg == WM_SIZE && wParam == SIZE_MINIMIZED) {
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+
+    if (msg == WM_TRAYICON) {
+        if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+            RestoreWindow(hwnd);
+        } else if (lParam == WM_RBUTTONUP) {
+            POINT pt;
+            GetCursorPos(&pt);
+            HMENU hMenu = CreatePopupMenu();
+            InsertMenuA(hMenu, 0, MF_BYPOSITION | MF_STRING, IDM_TRAY_OPEN, "Open osu!Point");
+            InsertMenuA(hMenu, 1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+            InsertMenuA(hMenu, 2, MF_BYPOSITION | MF_STRING, IDM_TRAY_EXIT, "Exit");
+
+            SetForegroundWindow(hwnd);
+            TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(hMenu);
+        }
+        return 0;
+    }
+
     if (msg == WM_COMMAND) {
         if (HIWORD(wParam) == EN_CHANGE && g_guiReady) {
             UpdateValues();
         }
         if (LOWORD(wParam) == 1001) {
             ResetToFullArea();
+        }
+        if (LOWORD(wParam) == IDM_TRAY_OPEN) {
+            RestoreWindow(hwnd);
+        }
+        if (LOWORD(wParam) == IDM_TRAY_EXIT) {
+            KillProcessNow();
+        }
+    }
+    if (msg == WM_CTLCOLOREDIT) {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, COLOR_TEXT);
+        SetBkColor(hdc, COLOR_EDIT_BG);
+        return (LRESULT)g_hBrushEdit;
+    }
+    if (msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLORBTN) {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, COLOR_TEXT_MUTED);
+        SetBkColor(hdc, COLOR_BG);
+        return (LRESULT)g_hBrushBg;
+    }
+    if (msg == WM_DRAWITEM) {
+        LPDRAWITEMSTRUCT pDIS = (LPDRAWITEMSTRUCT)lParam;
+        if (pDIS->CtlID == 1001) {
+            FillRect(pDIS->hDC, &pDIS->rcItem, g_hBrushBg);
+
+            bool pressed = (pDIS->itemState & ODS_SELECTED);
+            HBRUSH btnBrush = CreateSolidBrush(pressed ? COLOR_BTN_HOVER : COLOR_BTN);
+            HPEN btnPen = CreatePen(PS_SOLID, 1, COLOR_BORDER);
+            HGDIOBJ ob = SelectObject(pDIS->hDC, btnBrush);
+            HGDIOBJ op = SelectObject(pDIS->hDC, btnPen);
+
+            RoundRect(pDIS->hDC, pDIS->rcItem.left, pDIS->rcItem.top, pDIS->rcItem.right, pDIS->rcItem.bottom, 6, 6);
+
+            SetBkMode(pDIS->hDC, TRANSPARENT);
+            SetTextColor(pDIS->hDC, COLOR_TEXT);
+            SelectObject(pDIS->hDC, g_hFont);
+            DrawTextA(pDIS->hDC, "Full Area (Reset)", -1, &pDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(pDIS->hDC, ob);
+            SelectObject(pDIS->hDC, op);
+            DeleteObject(btnBrush);
+            DeleteObject(btnPen);
+            return TRUE;
         }
     }
     if (msg == WM_PAINT) {
@@ -560,34 +744,66 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     DetectAndInitTablet();
     LoadConfig();
 
+    g_hBrushBg = CreateSolidBrush(COLOR_BG);
+    g_hBrushEdit = CreateSolidBrush(COLOR_EDIT_BG);
+    g_hFont = CreateFontA(15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+
     WNDCLASSA wc = { 0 };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = g_hBrushBg;
     wc.lpszClassName = "osuPoint_Driver";
     RegisterClassA(&wc);
 
     std::string title = "osu!Point - [" + g_spec.name + "]";
     g_hwnd = CreateWindowA("osuPoint_Driver", title.c_str(),
         WS_OVERLAPPEDWINDOW ^ (WS_THICKFRAME | WS_MAXIMIZEBOX), 
-        CW_USEDEFAULT, CW_USEDEFAULT, 460, 240, NULL, NULL, hInst, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 470, 240, NULL, NULL, hInst, NULL);
 
-    CreateWindowA("STATIC", "Width (mm):", WS_VISIBLE | WS_CHILD, 10, 15, 110, 20, g_hwnd, NULL, NULL, NULL);
-    hW = CreateWindowA("EDIT", FormatDouble(g_cfg.width_mm.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER, 125, 15, 80, 20, g_hwnd, NULL, NULL, NULL);
+    BOOL useDarkMode = TRUE;
+    if (FAILED(DwmSetWindowAttribute(g_hwnd, 20, &useDarkMode, sizeof(useDarkMode)))) {
+        DwmSetWindowAttribute(g_hwnd, 19, &useDarkMode, sizeof(useDarkMode));
+    }
 
-    CreateWindowA("STATIC", "Height (mm):", WS_VISIBLE | WS_CHILD, 10, 45, 110, 20, g_hwnd, NULL, NULL, NULL);
-    hH = CreateWindowA("EDIT", FormatDouble(g_cfg.height_mm.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER, 125, 45, 80, 20, g_hwnd, NULL, NULL, NULL);
+    HICON hIcon = CreateAppIcon();
+    if (hIcon) {
+        SendMessage(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+        SendMessage(g_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
 
-    CreateWindowA("STATIC", "Center X (mm):", WS_VISIBLE | WS_CHILD, 10, 75, 110, 20, g_hwnd, NULL, NULL, NULL);
-    hCX = CreateWindowA("EDIT", FormatDouble(g_cfg.center_x_mm.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER, 125, 75, 80, 20, g_hwnd, NULL, NULL, NULL);
+        // Register System Tray Icon
+        g_nid.cbSize = sizeof(NOTIFYICONDATAA);
+        g_nid.hWnd = g_hwnd;
+        g_nid.uID = 1;
+        g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        g_nid.uCallbackMessage = WM_TRAYICON;
+        g_nid.hIcon = hIcon;
+        strncpy_s(g_nid.szTip, title.c_str(), sizeof(g_nid.szTip) - 1);
+        Shell_NotifyIconA(NIM_ADD, &g_nid);
+    }
 
-    CreateWindowA("STATIC", "Center Y (mm):", WS_VISIBLE | WS_CHILD, 10, 105, 110, 20, g_hwnd, NULL, NULL, NULL);
-    hCY = CreateWindowA("EDIT", FormatDouble(g_cfg.center_y_mm.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER, 125, 105, 80, 20, g_hwnd, NULL, NULL, NULL);
+    HWND lblW = CreateWindowA("STATIC", "Width (mm):", WS_VISIBLE | WS_CHILD, 15, 15, 105, 20, g_hwnd, NULL, NULL, NULL);
+    hW = CreateWindowA("EDIT", FormatDouble(g_cfg.width_mm.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 125, 14, 80, 22, g_hwnd, NULL, NULL, NULL);
 
-    CreateWindowA("STATIC", "Rotation (deg):", WS_VISIBLE | WS_CHILD, 10, 135, 110, 20, g_hwnd, NULL, NULL, NULL);
-    hRot = CreateWindowA("EDIT", FormatDouble(g_cfg.rotation_deg.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER, 125, 135, 80, 20, g_hwnd, NULL, NULL, NULL);
+    HWND lblH = CreateWindowA("STATIC", "Height (mm):", WS_VISIBLE | WS_CHILD, 15, 45, 105, 20, g_hwnd, NULL, NULL, NULL);
+    hH = CreateWindowA("EDIT", FormatDouble(g_cfg.height_mm.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 125, 44, 80, 22, g_hwnd, NULL, NULL, NULL);
 
-    CreateWindowA("BUTTON", "Full Area (Reset)", WS_VISIBLE | WS_CHILD, 10, 165, 195, 25, g_hwnd, (HMENU)1001, NULL, NULL);
+    HWND lblCX = CreateWindowA("STATIC", "Center X (mm):", WS_VISIBLE | WS_CHILD, 15, 75, 105, 20, g_hwnd, NULL, NULL, NULL);
+    hCX = CreateWindowA("EDIT", FormatDouble(g_cfg.center_x_mm.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 125, 74, 80, 22, g_hwnd, NULL, NULL, NULL);
+
+    HWND lblCY = CreateWindowA("STATIC", "Center Y (mm):", WS_VISIBLE | WS_CHILD, 15, 105, 105, 20, g_hwnd, NULL, NULL, NULL);
+    hCY = CreateWindowA("EDIT", FormatDouble(g_cfg.center_y_mm.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 125, 104, 80, 22, g_hwnd, NULL, NULL, NULL);
+
+    HWND lblRot = CreateWindowA("STATIC", "Rotation (deg):", WS_VISIBLE | WS_CHILD, 15, 135, 105, 20, g_hwnd, NULL, NULL, NULL);
+    hRot = CreateWindowA("EDIT", FormatDouble(g_cfg.rotation_deg.load()).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 125, 134, 80, 22, g_hwnd, NULL, NULL, NULL);
+
+    HWND btnReset = CreateWindowA("BUTTON", "Full Area (Reset)", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 15, 166, 190, 26, g_hwnd, (HMENU)1001, NULL, NULL);
+
+    HWND uiControls[] = { lblW, hW, lblH, hH, lblCX, hCX, lblCY, hCY, lblRot, hRot, btnReset };
+    for (HWND c : uiControls) {
+        SendMessage(c, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    }
 
     g_guiReady = true;
     UpdateValues();

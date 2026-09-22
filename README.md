@@ -24,23 +24,86 @@ Most osu! players rely on OpenTabletDriver (OTD). While OTD is a great project w
 | **Software Pipeline Latency** | 4–15 ms (smoothing filters) | 0.5–1.5 ms | **< 50 nanoseconds** |
 | **Memory Allocations per Packet** | Yes | Yes | **0 bytes (pure registers)** |
 | **RAM Usage** | ~200 MB | ~80 MB | **< 2.5 MB** |
-| **Binary Size** | ~150 MB | ~45 MB | **~300 KB (standalone .exe)** |
+| **Binary Size** | ~150 MB | ~45 MB | **~130 KB (standalone .exe)** |
 | **Driver / Kernel Cert Required** | Yes | Yes (for VMulti output) | **None (User-Mode Win32)** |
+
+---
+
+## Supported Tablets (Out-of-the-Box)
+
+The release archive includes pre-configured hardware profiles inside the `tablets/` directory. When launched, **osu!Point automatically detects your connected tablet via USB VID/PID** and loads its physical specs:
+
+### Wacom
+* **One by Wacom:** CTL-472, CTL-672, CTL-471
+* **Intuos (Classic):** CTL-480, CTH-480, CTL-490, CTL-4100, CTL-6100
+* **Bamboo:** CTL-470
+* **Intuos 4 & 5:** PTK-440, PTK-640, PTH-450, PTH-650
+* **Intuos Pro (Gen 1):** PTH-451, PTH-651, PTH-851
+* **Intuos Pro (Gen 2):** PTH-460, PTH-660, PTH-860
+
+### XP-Pen
+* **Star Series:** Star G640, Star G430S, Star G640S
+* **Deco Series:** Deco 01
+
+### Gaomon
+* S620
+
+### Huion
+* 420 / H420
+* Inspiroy H430P
+* Inspiroy H640P
+
+### VEIKK
+* S640
 
 ---
 
 ## Architecture & Key Features
 
-* **High-Rate Absolute Event Stream (`SendInput`):** Instead of using `SetCursorPos` (which Windows DWM throttles to your monitor's display refresh rate), osu!Point uses high-speed `SendInput` mapped to the 16-bit Windows absolute mouse grid (`0`–`65535`). This guarantees unthrottled 1000 Hz+ throughput for overclocked hardware and custom firmware mods.
-* **Precalculated Inverse Rotation:** Supports arbitrary rotation angles with decimal precision (e.g. `-3°` or `14.5°`). Trigonometric functions (`sin`/`cos`) are precomputed only when settings change; the game loop executes only fast additions and multiplications.
+* **Unthrottled 1000 Hz+ Pipeline (`SendInput`):** Instead of `SetCursorPos` (which Windows DWM caps to your display refresh rate), osu!Point uses high-speed `SendInput` mapped to the 16-bit absolute mouse coordinate grid (`0`–`65535`). This guarantees unthrottled 1000 Hz+ throughput for custom firmware and overclocked hardware.
+* **Precalculated Inverse Rotation:** Supports arbitrary rotation angles with decimal precision (e.g. `-3°` or `14.5°`). Trigonometric functions (`sin`/`cos`) are precomputed once on input; the tracking loop executes only fast additions and multiplications.
 * **Familiar Coordinate System:** Active areas are defined by Width, Height, Center X, and Center Y in millimeters, identical to OpenTabletDriver.
-* **Hardware Boundary Clamping:** The active area is mathematically constrained inside the physical tablet dimensions, preventing the cursor box from leaving the usable surface even under extreme rotation.
-* **Modern Dark UI:** Includes a native Windows 10/11 dark title bar (`DWMWA_USE_IMMERSIVE_DARK_MODE`), Segoe UI typography, and a realistic tablet bezel preview that prevents border clipping at Full Area.
-* **Procedural 32-bit Transparent Icon:** Dynamically generates an anti-aliased alpha-blended badge directly in memory—no external `.ico` files or taskbar background boxes.
-* **Modular Tablet Profiles:** Support for any tablet model can be added via plain text `.cfg` files inside the `tablets/` directory without recompiling.
+* **Hardware Boundary Clamping:** The active area is mathematically bounded within physical tablet limits, preventing the cursor box from leaving the usable surface even under extreme rotation.
+* **Modern Dark UI:** Features a native Windows 10/11 dark title bar (`DWMWA_USE_IMMERSIVE_DARK_MODE`), Segoe UI typography, and a realistic tablet bezel preview that prevents border clipping at Full Area.
+* **Procedural 32-bit Transparent Icon:** Built-in anti-aliased ARGB application icon generated dynamically in memory—no external `.ico` files or taskbar background boxes.
 * **Thread Affinity & Priority:** The USB polling thread is isolated onto a dedicated physical CPU core (`Core 2`) and elevated to `THREAD_PRIORITY_TIME_CRITICAL`.
 * **High-Resolution System Timers:** Automatically enforces a 1 ms Windows timer period (`timeBeginPeriod(1)`) to eliminate OS thread scheduler jitter.
 * **Auto-Recovery & Persistence:** Settings are auto-saved to `config.ini` in the executable folder. Corrupted or missing configs self-heal to full-area factory defaults.
+
+---
+
+## Release Package Structure
+
+When downloading the release `.zip`, keep the executable and the `tablets/` folder together:
+
+```text
+osuPoint/
+├── driver.exe
+├── config.ini          (generated on first launch)
+└── tablets/
+    ├── Wacom_CTL-472.cfg
+    ├── Wacom_CTL-480.cfg
+    ├── XP-Pen_G640.cfg
+    ├── Gaomon_S620.cfg
+    └── ... (28 pre-built profiles)
+```
+
+---
+
+## Setup & osu! Configuration
+
+### 1. System Preparation
+If official tablet software (e.g. Wacom Desktop Center) is installed, stop its background services:
+1. Open Task Manager $\to$ Services tab.
+2. Locate `WTabletServicePro` or `Wacom Professional Service` $\to$ Right-click $\to$ **Stop**.
+*(Otherwise, Windows will prevent user-mode applications from accessing the tablet's USB handle).*
+
+### 2. In-Game Settings (Critical)
+* **Raw Input: OFF.**
+  > **Why:** Windows pointer acceleration curves only affect *relative* mouse deltas ($\Delta X, \Delta Y$). Because osu!Point uses `MOUSEEVENTF_ABSOLUTE`, Windows applies **zero acceleration**—the mapping is 100% linear. Enabling Raw Input in osu! forces the game engine to interpret absolute coordinates as relative deltas, which can cause the cursor to snap to the top-left corner or introduce redundant normalization math.
+* **Mouse Sensitivity: 1.0x.**
+  > Adjust your play area strictly inside osu!Point using millimeters.
+* **Screen Mode: Exclusive Fullscreen or Borderless.**
 
 ---
 
@@ -61,45 +124,26 @@ cl /O2 /Oi /Ot /GL /std:c++20 driver.cpp /link /SUBSYSTEM:WINDOWS
 
 ---
 
-## Setup & osu! Configuration
+## Adding More Tablets
 
-### 1. System Preparation
-If official Wacom software is installed, stop its background services:
-1. Open Task Manager $\to$ Services tab.
-2. Locate `WTabletServicePro` or `Wacom Professional Service` $\to$ Right-click $\to$ **Stop**.
-*(Otherwise, Windows will prevent user-mode applications from accessing the tablet's USB handle).*
-
-### 2. In-Game Settings (Critical)
-* **Raw Input: OFF.** 
-  > **Why:** Windows pointer acceleration curves only affect *relative* mouse deltas ($\Delta X, \Delta Y$). Because osu!Point uses `MOUSEEVENTF_ABSOLUTE`, Windows applies **zero acceleration**—the mapping is 100% linear. Enabling Raw Input in osu! forces the game engine to interpret absolute coordinates as relative deltas, which can cause the cursor to snap to the top-left corner or introduce redundant normalization math.
-* **Mouse Sensitivity: 1.0x.**
-  > Adjust your play area strictly inside osu!Point using millimeters.
-* **Screen Mode: Exclusive Fullscreen or Borderless.**
-
----
-
-## Adding Other Tablets
-
-On first launch, osu!Point creates a `tablets/` directory and generates a default configuration file for the Wacom CTL-472.
-
-To add another tablet (such as an XP-Pen, Gaomon, or Huion), create a new `.cfg` file in the `tablets/` folder (for example, `XP-Pen_G640.cfg`):
+If your tablet model is not among the 28 pre-configured profiles, you can add support for it by creating a new `.cfg` file in the `tablets/` folder:
 
 ```ini
-name=XP-Pen G640
-vid=0x28BD
-pid=0x0094
-max_x=32767
-max_y=32767
-width_mm=152.4
-height_mm=101.6
-report_len=8
+name=Your Tablet Name
+vid=0x056A
+pid=0x037A
+max_x=15200
+max_y=9500
+width_mm=152.0
+height_mm=95.0
+report_len=10
 report_id=0x02
 x_offset=2
 y_offset=4
-init_feature=
+init_feature=0x02 0x02
 ```
 
-When launched, osu!Point scans connected USB devices, matches the `VID`/`PID`, displays the detected model in the window title, and adapts the coordinate scaling and visual preview to the physical dimensions of that tablet.
+Upon startup, osu!Point will match the USB `VID`/`PID`, display the model name in the title bar, and adapt the coordinate scaling and visual preview to the physical dimensions of that tablet.
 
 ---
 

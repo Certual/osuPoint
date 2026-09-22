@@ -21,6 +21,7 @@ Most osu! players rely on OpenTabletDriver (OTD). While OTD is a great project w
 | :--- | :--- | :--- | :--- |
 | **Language** | C++ / Background Services | C# (.NET Core) | **Native C++20** |
 | **Garbage Collector (GC)** | None | Yes (.NET GC) | **None (Zero allocations)** |
+| **Kernel Scheduling** | Normal | Standard Threading | **MMCSS Pro Audio (Real-Time)** |
 | **Software Pipeline Latency** | 4–15 ms (smoothing filters) | 0.5–1.5 ms | **< 50 nanoseconds** |
 | **Memory Allocations per Packet** | Yes | Yes | **0 bytes (pure registers)** |
 | **RAM Usage** | ~200 MB | ~80 MB | **< 2.5 MB** |
@@ -60,14 +61,16 @@ The release archive includes pre-configured hardware profiles inside the `tablet
 
 ## Architecture & Key Features
 
-* **Unthrottled 1000 Hz+ Pipeline (`SendInput`):** Instead of `SetCursorPos` (which Windows DWM caps to your display refresh rate), osu!Point uses high-speed `SendInput` mapped to the 16-bit absolute mouse coordinate grid (`0`–`65535`). This guarantees unthrottled 1000 Hz+ throughput for custom firmware and overclocked hardware.
+* **MMCSS Real-Time Audio Scheduling:** The USB polling thread is registered with the Windows Multimedia Class Scheduler Service (`AvSetMmThreadCharacteristicsA("Pro Audio")`) with `AVRT_PRIORITY_CRITICAL`. This bypasses standard OS thread scheduling decay and protects input polling from background app interference.
+* **Sub-Millisecond 0.5 ms Kernel Timers:** Calls undocumented NTAPI `NtSetTimerResolution` to lock the Windows kernel scheduling interval to 0.5 ms (5000 units of 100 ns), cutting timer quantization jitter in half.
+* **Unthrottled 1000 Hz+ Pipeline (`SendInput`):** Instead of `SetCursorPos` (which Windows DWM throttles to your monitor's display refresh rate), osu!Point uses high-speed `SendInput` mapped to the 16-bit absolute mouse coordinate grid (`0`–`65535`). This guarantees unthrottled 1000 Hz+ throughput for custom firmware and overclocked hardware.
 * **Precalculated Inverse Rotation:** Supports arbitrary rotation angles with decimal precision (e.g. `-3°` or `14.5°`). Trigonometric functions (`sin`/`cos`) are precomputed once on input; the tracking loop executes only fast additions and multiplications.
 * **Familiar Coordinate System:** Active areas are defined by Width, Height, Center X, and Center Y in millimeters, identical to OpenTabletDriver.
 * **Hardware Boundary Clamping:** The active area is mathematically bounded within physical tablet limits, preventing the cursor box from leaving the usable surface even under extreme rotation.
-* **Modern Dark UI:** Features a native Windows 10/11 dark title bar (`DWMWA_USE_IMMERSIVE_DARK_MODE`), Segoe UI typography, and a realistic tablet bezel preview that prevents border clipping at Full Area.
-* **Procedural 32-bit Transparent Icon:** Built-in anti-aliased ARGB application icon generated dynamically in memory—no external `.ico` files or taskbar background boxes.
-* **Thread Affinity & Priority:** The USB polling thread is isolated onto a dedicated physical CPU core (`Core 2`) and elevated to `THREAD_PRIORITY_TIME_CRITICAL`.
-* **High-Resolution System Timers:** Automatically enforces a 1 ms Windows timer period (`timeBeginPeriod(1)`) to eliminate OS thread scheduler jitter.
+* **Seamless Hot-Plug Engine:** Unplugging or reconnecting the tablet USB cable is handled gracefully without restarting the app and with flat 0.0% idle CPU consumption.
+* **Modern Dark UI & System Tray:** Features native Windows 10/11 dark titlebar styling, Segoe UI typography, a bezel-aware preview canvas, and full minimization to the system tray (`_`).
+* **Procedural 32-bit Transparent Icon:** Dynamically generates an anti-aliased ARGB badge directly in memory with true alpha transparency—no external `.ico` files or taskbar background boxes.
+* **Thread Affinity:** The polling thread is isolated onto a dedicated physical CPU core (`Core 2`) to avoid DPC/ISR interrupt contention on Core 0.
 * **Auto-Recovery & Persistence:** Settings are auto-saved to `config.ini` in the executable folder. Corrupted or missing configs self-heal to full-area factory defaults.
 
 ---
@@ -90,7 +93,7 @@ osuPoint/
 
 ---
 
-## Setup & osu! Configuration
+## Setup & In-Game Configuration
 
 ### 1. System Preparation
 If official tablet software (e.g. Wacom Desktop Center) is installed, stop its background services:
@@ -98,7 +101,10 @@ If official tablet software (e.g. Wacom Desktop Center) is installed, stop its b
 2. Locate `WTabletServicePro` or `Wacom Professional Service` $\to$ Right-click $\to$ **Stop**.
 *(Otherwise, Windows will prevent user-mode applications from accessing the tablet's USB handle).*
 
-### 2. In-Game Settings (Critical)
+### 2. Hardware Topology Tip (Lowest Hardware Latency)
+For the lowest physical latency, plug your tablet directly into the **rear motherboard USB ports routed to the CPU (Direct CPU Lanes)** rather than ports routed through the motherboard chipset (PCH) or external USB hubs/monitors. Refer to your motherboard manual for CPU-direct USB port locations.
+
+### 3. In-Game Settings (Critical)
 * **Raw Input: OFF.**
   > **Why:** Windows pointer acceleration curves only affect *relative* mouse deltas ($\Delta X, \Delta Y$). Because osu!Point uses `MOUSEEVENTF_ABSOLUTE`, Windows applies **zero acceleration**—the mapping is 100% linear. Enabling Raw Input in osu! forces the game engine to interpret absolute coordinates as relative deltas, which can cause the cursor to snap to the top-left corner or introduce redundant normalization math.
 * **Mouse Sensitivity: 1.0x.**
@@ -120,7 +126,7 @@ cd C:\path\to\osuPoint
 ```cmd
 cl /O2 /Oi /Ot /GL /std:c++20 driver.cpp /link /SUBSYSTEM:WINDOWS
 ```
-4. A standalone `driver.exe` (~130 KB) will be generated.
+4. A standalone `driver.exe` (~300 KB) will be generated.
 
 ---
 

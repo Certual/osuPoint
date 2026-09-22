@@ -24,7 +24,7 @@ Most osu! players rely on OpenTabletDriver (OTD). While OTD is a great project w
 | **Software Pipeline Latency** | 4–15 ms (smoothing filters) | 0.5–1.5 ms | **< 50 nanoseconds** |
 | **Memory Allocations per Packet** | Yes | Yes | **0 bytes (pure registers)** |
 | **RAM Usage** | ~200 MB | ~80 MB | **< 2.5 MB** |
-| **Binary Size** | ~150 MB | ~45 MB | **~130 KB (standalone .exe)** |
+| **Binary Size** | ~150 MB | ~45 MB | **~300 KB (standalone .exe)** |
 | **Driver / Kernel Cert Required** | Yes | Yes (for VMulti output) | **None (User-Mode Win32)** |
 
 ---

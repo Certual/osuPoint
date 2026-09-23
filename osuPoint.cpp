@@ -3,16 +3,19 @@
 #include <timeapi.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <avrt.h>
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <hidpi.h>
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <span>
 #include <string>
 #include <vector>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -23,21 +26,38 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "avrt.lib")
 
 constexpr double PI = 3.14159265358979323846;
 constexpr UINT WM_TRAYICON = WM_USER + 1;
 constexpr UINT IDM_TRAY_OPEN = 2001;
 constexpr UINT IDM_TRAY_EXIT = 2002;
 
-const COLORREF COLOR_BG         = RGB(20, 20, 24);
-const COLORREF COLOR_CARD       = RGB(28, 28, 34);
-const COLORREF COLOR_EDIT_BG    = RGB(36, 36, 44);
-const COLORREF COLOR_TEXT       = RGB(230, 230, 235);
+typedef NTSTATUS(NTAPI* pfnNtSetTimerResolution)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+
+#ifndef ThreadPowerThrottling
+#define ThreadPowerThrottling static_cast<THREAD_INFORMATION_CLASS>(1)
+#endif
+
+#ifndef THREAD_POWER_THROTTLING_CURRENT_VERSION
+typedef struct _THREAD_POWER_THROTTLING_STATE {
+    ULONG Version;
+    ULONG ControlMask;
+    ULONG StateMask;
+} THREAD_POWER_THROTTLING_STATE, * PTHREAD_POWER_THROTTLING_STATE;
+#define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
+#define THREAD_POWER_THROTTLING_EXECUTION_SPEED 1
+#endif
+
+const COLORREF COLOR_BG = RGB(20, 20, 24);
+const COLORREF COLOR_CARD = RGB(28, 28, 34);
+const COLORREF COLOR_EDIT_BG = RGB(36, 36, 44);
+const COLORREF COLOR_TEXT = RGB(230, 230, 235);
 const COLORREF COLOR_TEXT_MUTED = RGB(140, 140, 155);
-const COLORREF COLOR_ACCENT     = RGB(255, 102, 170); // osu! Pink
-const COLORREF COLOR_BTN        = RGB(38, 38, 48);
-const COLORREF COLOR_BTN_HOVER  = RGB(52, 52, 66);
-const COLORREF COLOR_BORDER     = RGB(55, 55, 68);
+const COLORREF COLOR_ACCENT = RGB(255, 102, 170); // osu! Pink
+const COLORREF COLOR_BTN = RGB(38, 38, 48);
+const COLORREF COLOR_BTN_HOVER = RGB(52, 52, 66);
+const COLORREF COLOR_BORDER = RGB(55, 55, 68);
 
 struct TabletSpec {
     std::string name = "Wacom One CTL-472";
@@ -78,6 +98,38 @@ HFONT g_hFont = NULL;
 HBRUSH g_hBrushBg = NULL;
 HBRUSH g_hBrushEdit = NULL;
 NOTIFYICONDATAA g_nid = { 0 };
+
+void EnableSubMillisecondTimer() {
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (hNtdll) {
+        auto NtSetTimerResolution = (pfnNtSetTimerResolution)GetProcAddress(hNtdll, "NtSetTimerResolution");
+        if (NtSetTimerResolution) {
+            ULONG currentRes = 0;
+            if (NtSetTimerResolution(5000, TRUE, &currentRes) == 0) {
+                return;
+            }
+        }
+    }
+    timeBeginPeriod(1);
+}
+
+void DisableSubMillisecondTimer() {
+    timeEndPeriod(1);
+}
+
+void DisablePowerThrottling() {
+    THREAD_POWER_THROTTLING_STATE pts{};
+    pts.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    pts.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    pts.StateMask = 0;
+
+    SetThreadInformation(
+        GetCurrentThread(),
+        ThreadPowerThrottling,
+        &pts,
+        sizeof(pts)
+    );
+}
 
 std::string GetExeDirectory() {
     char exePath[MAX_PATH];
@@ -138,18 +190,18 @@ void EnsureDefaultTabletProfile(const std::string& folder) {
     if (!check.is_open()) {
         std::ofstream f(defFile);
         f << "# osu!Point Tablet Profile\n"
-          << "name=Wacom One CTL-472\n"
-          << "vid=0x056A\n"
-          << "pid=0x037A\n"
-          << "max_x=15200\n"
-          << "max_y=9500\n"
-          << "width_mm=152.0\n"
-          << "height_mm=95.0\n"
-          << "report_len=10\n"
-          << "report_id=0x02\n"
-          << "x_offset=2\n"
-          << "y_offset=4\n"
-          << "init_feature=0x02 0x02\n";
+            << "name=Wacom One CTL-472\n"
+            << "vid=0x056A\n"
+            << "pid=0x037A\n"
+            << "max_x=15200\n"
+            << "max_y=9500\n"
+            << "width_mm=152.0\n"
+            << "height_mm=95.0\n"
+            << "report_len=10\n"
+            << "report_id=0x02\n"
+            << "x_offset=2\n"
+            << "y_offset=4\n"
+            << "init_feature=0x02 0x02\n";
     }
 }
 
@@ -283,7 +335,8 @@ void LoadConfig() {
 
     if (!has_w || !has_h || !has_cx || !has_cy || w <= 0 || h <= 0 || cx <= 0 || cy <= 0) {
         SetDefaults();
-    } else {
+    }
+    else {
         g_cfg.width_mm = w;
         g_cfg.height_mm = h;
         g_cfg.center_x_mm = cx;
@@ -295,95 +348,144 @@ void LoadConfig() {
     }
 }
 
+void UpdateStatusText(const std::string& status) {
+    if (g_hwnd) {
+        std::string title = "osu!Point - [" + status + "]";
+        SetWindowTextA(g_hwnd, title.c_str());
+        strncpy_s(g_nid.szTip, title.c_str(), sizeof(g_nid.szTip) - 1);
+        Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+    }
+}
+
+inline uint16_t ReadLE16(const BYTE* ptr) noexcept {
+    uint16_t val;
+    std::memcpy(&val, ptr, sizeof(uint16_t));
+    return val;
+}
+
 void DriverThread() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     SetThreadAffinityMask(GetCurrentThread(), (1ULL << 2));
 
-    std::string devPath = DetectAndInitTablet();
-    if (devPath.empty()) {
-        MessageBoxA(NULL, "Tablet not found! Please check the USB connection.", "osu!Point", MB_ICONERROR);
-        return;
+    DisablePowerThrottling();
+
+    DWORD taskIndex = 0;
+    HANDLE hMmcss = AvSetMmThreadCharacteristicsA("Pro Audio", &taskIndex);
+    if (hMmcss) {
+        AvSetMmThreadPriority(hMmcss, AVRT_PRIORITY_CRITICAL);
     }
 
-    if (g_hwnd) {
-        std::string title = "osu!Point - [" + g_spec.name + "]";
-        SetWindowTextA(g_hwnd, title.c_str());
-
-        strncpy_s(g_nid.szTip, title.c_str(), sizeof(g_nid.szTip) - 1);
-        Shell_NotifyIconA(NIM_MODIFY, &g_nid);
-    }
-
-    g_hDevice = CreateFileA(devPath.c_str(), GENERIC_READ | GENERIC_WRITE, 
-        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-
-    if (g_hDevice == INVALID_HANDLE_VALUE) {
-        g_hDevice = CreateFileA(devPath.c_str(), GENERIC_READ, 
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-    }
-
-    if (g_hDevice == INVALID_HANDLE_VALUE) {
-        MessageBoxA(NULL, "Device handle is busy or locked by another process!", "osu!Point", MB_ICONERROR);
-        return;
-    }
-
-    if (!g_spec.init_feature.empty()) {
-        HidD_SetFeature(g_hDevice, g_spec.init_feature.data(), static_cast<ULONG>(g_spec.init_feature.size()));
-    }
-
-    BYTE report[64];
+    BYTE rawReportBuffer[64];
     DWORD bytesRead = 0;
-
-    const int xo = g_spec.x_offset;
-    const int yo = g_spec.y_offset;
-    const int req_id = g_spec.report_id;
-    const int max_x = g_spec.max_x;
-    const int max_y = g_spec.max_y;
 
     INPUT mouseInput = { 0 };
     mouseInput.type = INPUT_MOUSE;
-    mouseInput.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    mouseInput.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
 
     while (g_running) {
-        if (ReadFile(g_hDevice, report, sizeof(report), &bytesRead, nullptr) && bytesRead > 0) {
-            int raw_x = 0, raw_y = 0;
-
-            if (req_id == 0 || report[0] == req_id || report[0] == 0x10) {
-                raw_x = (report[xo + 1] << 8) | report[xo];
-                raw_y = (report[yo + 1] << 8) | report[yo];
-            } else if (bytesRead >= 6) {
-                raw_x = (report[xo] << 8) | report[xo - 1];
-                raw_y = (report[yo] << 8) | report[yo - 1];
+        if (g_hDevice == INVALID_HANDLE_VALUE) {
+            std::string devPath = DetectAndInitTablet();
+            if (devPath.empty()) {
+                UpdateStatusText("Waiting for tablet...");
+                Sleep(300);
+                continue;
             }
 
-            if (raw_x == 0 && raw_y == 0) continue;
-            if (raw_x > max_x || raw_y > max_y) continue;
+            g_hDevice = CreateFileA(devPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                0, nullptr, OPEN_EXISTING, 0, nullptr);
 
-            double px = static_cast<double>(raw_x) * g_inv_scale_x;
-            double py = static_cast<double>(raw_y) * g_inv_scale_y;
+            if (g_hDevice == INVALID_HANDLE_VALUE) {
+                g_hDevice = CreateFileA(devPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+            }
 
-            double cx = g_cfg.center_x_mm.load(std::memory_order_relaxed);
-            double cy = g_cfg.center_y_mm.load(std::memory_order_relaxed);
-            double w  = g_cfg.width_mm.load(std::memory_order_relaxed);
-            double h  = g_cfg.height_mm.load(std::memory_order_relaxed);
-            double cos_r = g_cfg.cos_val.load(std::memory_order_relaxed);
-            double sin_r = g_cfg.sin_val.load(std::memory_order_relaxed);
+            if (g_hDevice == INVALID_HANDLE_VALUE) {
+                g_hDevice = CreateFileA(devPath.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+            }
 
-            double dx = px - cx;
-            double dy = py - cy;
-            double lx = dx * cos_r - dy * sin_r;
-            double ly = dx * sin_r + dy * cos_r;
+            if (g_hDevice == INVALID_HANDLE_VALUE) {
+                Sleep(300);
+                continue;
+            }
 
-            double half_w = w * 0.5;
-            double half_h = h * 0.5;
+            HidD_SetNumInputBuffers(g_hDevice, 2);
 
-            double cl_x = (std::max)(-half_w, (std::min)(half_w, lx));
-            double cl_y = (std::max)(-half_h, (std::min)(half_h, ly));
+            if (!g_spec.init_feature.empty()) {
+                HidD_SetFeature(g_hDevice, g_spec.init_feature.data(), static_cast<ULONG>(g_spec.init_feature.size()));
+            }
 
-            mouseInput.mi.dx = static_cast<LONG>(((cl_x + half_w) / w) * 65535.0);
-            mouseInput.mi.dy = static_cast<LONG>(((cl_y + half_h) / h) * 65535.0);
-
-            SendInput(1, &mouseInput, sizeof(INPUT));
+            UpdateStatusText(g_spec.name);
         }
+
+        if (!ReadFile(g_hDevice, rawReportBuffer, sizeof(rawReportBuffer), &bytesRead, nullptr) || bytesRead == 0) {
+            CloseHandle(g_hDevice);
+            g_hDevice = INVALID_HANDLE_VALUE;
+            Sleep(150);
+            continue;
+        }
+
+        std::span<const BYTE> report(rawReportBuffer, bytesRead);
+
+        int raw_x = 0, raw_y = 0;
+        const int xo = g_spec.x_offset;
+        const int yo = g_spec.y_offset;
+        const int req_id = g_spec.report_id;
+        const int max_x = g_spec.max_x;
+        const int max_y = g_spec.max_y;
+
+        if (req_id == 0 || report[0] == req_id || report[0] == 0x10) {
+            if (xo + 2 <= static_cast<int>(report.size()) && yo + 2 <= static_cast<int>(report.size())) {
+                raw_x = ReadLE16(&report[xo]);
+                raw_y = ReadLE16(&report[yo]);
+            }
+        }
+        else if (report.size() >= 6) {
+            if (xo + 1 <= static_cast<int>(report.size()) && yo + 1 <= static_cast<int>(report.size())) {
+                raw_x = ReadLE16(&report[xo - 1]);
+                raw_y = ReadLE16(&report[yo - 1]);
+            }
+        }
+
+        if (raw_x == 0 && raw_y == 0) continue;
+        if (raw_x > max_x || raw_y > max_y) continue;
+
+        double px = static_cast<double>(raw_x) * g_inv_scale_x;
+        double py = static_cast<double>(raw_y) * g_inv_scale_y;
+
+        double cx = g_cfg.center_x_mm.load(std::memory_order_relaxed);
+        double cy = g_cfg.center_y_mm.load(std::memory_order_relaxed);
+        double w = g_cfg.width_mm.load(std::memory_order_relaxed);
+        double h = g_cfg.height_mm.load(std::memory_order_relaxed);
+        double cos_r = g_cfg.cos_val.load(std::memory_order_relaxed);
+        double sin_r = g_cfg.sin_val.load(std::memory_order_relaxed);
+
+        double dx = px - cx;
+        double dy = py - cy;
+        double lx = dx * cos_r - dy * sin_r;
+        double ly = dx * sin_r + dy * cos_r;
+
+        double half_w = w * 0.5;
+        double half_h = h * 0.5;
+
+        double cl_x = (std::max)(-half_w, (std::min)(half_w, lx));
+        double cl_y = (std::max)(-half_h, (std::min)(half_h, ly));
+
+        double norm_x = (cl_x + half_w) / w;
+        double norm_y = (cl_y + half_h) / h;
+
+        if (std::isnan(norm_x) || std::isnan(norm_y) || std::isinf(norm_x) || std::isinf(norm_y)) {
+            continue;
+        }
+
+        mouseInput.mi.dx = static_cast<LONG>(norm_x * 65535.0);
+        mouseInput.mi.dy = static_cast<LONG>(norm_y * 65535.0);
+
+        SendInput(1, &mouseInput, sizeof(INPUT));
+    }
+
+    if (hMmcss) {
+        AvRevertMmThreadCharacteristics(hMmcss);
     }
 }
 
@@ -486,9 +588,11 @@ HICON CreateAppIcon() {
 
                     if (d <= 3.2f) {
                         r_sum += 255; g_sum += 255; b_sum += 255; a_sum += 255;
-                    } else if (d <= 7.0f) {
+                    }
+                    else if (d <= 7.0f) {
                         r_sum += 28; g_sum += 28; b_sum += 34; a_sum += 255;
-                    } else if (d <= 14.5f) {
+                    }
+                    else if (d <= 14.5f) {
                         r_sum += 255; g_sum += 102; b_sum += 170; a_sum += 255;
                     }
                 }
@@ -529,8 +633,8 @@ void DrawPreview(HDC hdc) {
     int active_max_w = max_draw_w - 2 * BEZEL;
     int active_max_h = max_draw_h - 2 * BEZEL;
 
-    double scale = (std::min)(static_cast<double>(active_max_w) / g_spec.phys_w, 
-                              static_cast<double>(active_max_h) / g_spec.phys_h);
+    double scale = (std::min)(static_cast<double>(active_max_w) / g_spec.phys_w,
+        static_cast<double>(active_max_h) / g_spec.phys_h);
 
     int active_w = static_cast<int>(std::round(g_spec.phys_w * scale));
     int active_h = static_cast<int>(std::round(g_spec.phys_h * scale));
@@ -554,8 +658,8 @@ void DrawPreview(HDC hdc) {
 
     double cx = g_cfg.center_x_mm.load(std::memory_order_relaxed);
     double cy = g_cfg.center_y_mm.load(std::memory_order_relaxed);
-    double w  = g_cfg.width_mm.load(std::memory_order_relaxed);
-    double h  = g_cfg.height_mm.load(std::memory_order_relaxed);
+    double w = g_cfg.width_mm.load(std::memory_order_relaxed);
+    double h = g_cfg.height_mm.load(std::memory_order_relaxed);
     double rot_deg = g_cfg.rotation_deg.load(std::memory_order_relaxed);
     double rad = rot_deg * (PI / 180.0);
 
@@ -627,9 +731,9 @@ void RestoreWindow(HWND hwnd) {
 
 void KillProcessNow() {
     g_running = false;
-    timeEndPeriod(1);
+    DisableSubMillisecondTimer();
     SaveConfig();
-    
+
     if (g_nid.hWnd) {
         Shell_NotifyIconA(NIM_DELETE, &g_nid);
         g_nid.hWnd = NULL;
@@ -656,7 +760,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
         if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
             RestoreWindow(hwnd);
-        } else if (lParam == WM_RBUTTONUP) {
+        }
+        else if (lParam == WM_RBUTTONUP) {
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
@@ -737,7 +842,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
-    timeBeginPeriod(1);
+    EnableSubMillisecondTimer();
     SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
 
     g_baseDir = GetExeDirectory();
@@ -759,7 +864,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
     std::string title = "osu!Point - [" + g_spec.name + "]";
     g_hwnd = CreateWindowA("osuPoint_Driver", title.c_str(),
-        WS_OVERLAPPEDWINDOW ^ (WS_THICKFRAME | WS_MAXIMIZEBOX), 
+        WS_OVERLAPPEDWINDOW ^ (WS_THICKFRAME | WS_MAXIMIZEBOX),
         CW_USEDEFAULT, CW_USEDEFAULT, 470, 240, NULL, NULL, hInst, NULL);
 
     BOOL useDarkMode = TRUE;
@@ -772,7 +877,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
         SendMessage(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
         SendMessage(g_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
 
-        // Register System Tray Icon
         g_nid.cbSize = sizeof(NOTIFYICONDATAA);
         g_nid.hWnd = g_hwnd;
         g_nid.uID = 1;

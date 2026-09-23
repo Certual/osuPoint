@@ -34,9 +34,18 @@ constexpr UINT IDM_TRAY_OPEN = 2001;
 constexpr UINT IDM_TRAY_EXIT = 2002;
 
 typedef NTSTATUS(NTAPI* pfnNtSetTimerResolution)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+typedef BOOL(WINAPI* pfnSetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
+#endif
 
 #ifndef ThreadPowerThrottling
 #define ThreadPowerThrottling static_cast<THREAD_INFORMATION_CLASS>(1)
+#endif
+
+#ifndef ProcessPowerThrottling
+#define ProcessPowerThrottling static_cast<PROCESS_INFORMATION_CLASS>(1)
 #endif
 
 #ifndef THREAD_POWER_THROTTLING_CURRENT_VERSION
@@ -47,6 +56,16 @@ typedef struct _THREAD_POWER_THROTTLING_STATE {
 } THREAD_POWER_THROTTLING_STATE, * PTHREAD_POWER_THROTTLING_STATE;
 #define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
 #define THREAD_POWER_THROTTLING_EXECUTION_SPEED 1
+#endif
+
+#ifndef PROCESS_POWER_THROTTLING_CURRENT_VERSION
+typedef struct _PROCESS_POWER_THROTTLING_STATE {
+    ULONG Version;
+    ULONG ControlMask;
+    ULONG StateMask;
+} PROCESS_POWER_THROTTLING_STATE, * PPROCESS_POWER_THROTTLING_STATE;
+#define PROCESS_POWER_THROTTLING_CURRENT_VERSION 1
+#define PROCESS_POWER_THROTTLING_EXECUTION_SPEED 1
 #endif
 
 const COLORREF COLOR_BG = RGB(20, 20, 24);
@@ -77,9 +96,11 @@ struct TabletSpec {
 double g_inv_scale_x = 152.0 / 15200.0;
 double g_inv_scale_y = 95.0 / 9500.0;
 
-struct DriverConfig {
+struct alignas(64) DriverConfig {
     std::atomic<double> width_mm{ 152.0 };
     std::atomic<double> height_mm{ 95.0 };
+    std::atomic<double> inv_width{ 1.0 / 152.0 };
+    std::atomic<double> inv_height{ 1.0 / 95.0 };
     std::atomic<double> center_x_mm{ 76.0 };
     std::atomic<double> center_y_mm{ 47.5 };
     std::atomic<double> rotation_deg{ 0.0 };
@@ -88,6 +109,21 @@ struct DriverConfig {
     std::atomic<double> sin_val{ 0.0 };
 } g_cfg;
 
+struct alignas(64) TargetMonitorMetrics {
+    std::atomic<double> scale_dx{ 65535.0 };
+    std::atomic<double> offset_dx{ 0.0 };
+    std::atomic<double> scale_dy{ 65535.0 };
+    std::atomic<double> offset_dy{ 0.0 };
+    std::atomic<DWORD> mouse_flags{ MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE };
+} g_targetMon;
+
+int g_target_monitor_idx = 0;
+int g_disp_w = 0;
+int g_disp_h = 0;
+int g_disp_x = -1;
+int g_disp_y = -1;
+
+FILETIME g_lastConfigTime = { 0 };
 std::atomic<bool> g_running{ true };
 HANDLE g_hDevice = INVALID_HANDLE_VALUE;
 HWND g_hwnd = NULL;
@@ -99,7 +135,31 @@ HBRUSH g_hBrushBg = NULL;
 HBRUSH g_hBrushEdit = NULL;
 NOTIFYICONDATAA g_nid = { 0 };
 
-void EnableSubMillisecondTimer() {
+inline std::string Trim(const std::string& str) noexcept {
+    size_t first = str.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = str.find_last_not_of(" \t\r\n");
+    return str.substr(first, (last - first + 1));
+}
+
+inline std::string ToLower(std::string str) noexcept {
+    for (char& c : str) {
+        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+    }
+    return str;
+}
+
+void EnablePerMonitorDpi() noexcept {
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        auto pSetDpi = (pfnSetProcessDpiAwarenessContext)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+        if (pSetDpi) {
+            pSetDpi(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
+}
+
+void EnableSubMillisecondTimer() noexcept {
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
     if (hNtdll) {
         auto NtSetTimerResolution = (pfnNtSetTimerResolution)GetProcAddress(hNtdll, "NtSetTimerResolution");
@@ -113,11 +173,23 @@ void EnableSubMillisecondTimer() {
     timeBeginPeriod(1);
 }
 
-void DisableSubMillisecondTimer() {
+void DisableSubMillisecondTimer() noexcept {
     timeEndPeriod(1);
 }
 
-void DisablePowerThrottling() {
+void DisableProcessPowerThrottlingLocally() noexcept {
+    PROCESS_POWER_THROTTLING_STATE pps{};
+    pps.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    pps.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    pps.StateMask = 0;
+
+    SetProcessInformation(
+        GetCurrentProcess(),
+        ProcessPowerThrottling,
+        &pps,
+        sizeof(pps)
+    );
+
     THREAD_POWER_THROTTLING_STATE pts{};
     pts.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
     pts.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
@@ -131,6 +203,129 @@ void DisablePowerThrottling() {
     );
 }
 
+void SetOptimalThreadAffinityLocally() noexcept {
+    DWORD_PTR processAffinity = 0, systemAffinity = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &processAffinity, &systemAffinity) && processAffinity != 0) {
+        unsigned int coreCount = 0;
+        for (DWORD_PTR m = processAffinity; m != 0; m >>= 1) {
+            if (m & 1) coreCount++;
+        }
+
+        DWORD_PTR targetMask = processAffinity;
+        if (coreCount >= 4 && (processAffinity & (1ULL << 2))) {
+            targetMask = (1ULL << 2);
+        }
+        else if (coreCount >= 2 && (processAffinity & (1ULL << 1))) {
+            targetMask = (1ULL << 1);
+        }
+        SetThreadAffinityMask(GetCurrentThread(), targetMask);
+    }
+}
+
+struct MonitorBounds {
+    int left = 0;
+    int top = 0;
+    int width = 1920;
+    int height = 1080;
+    bool is_primary = true;
+};
+
+BOOL CALLBACK EnumMonitorsProc(HMONITOR hMon, HDC, LPRECT, LPARAM lParam) {
+    auto* list = reinterpret_cast<std::vector<MonitorBounds>*>(lParam);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoA(hMon, &mi)) {
+        MonitorBounds b;
+        b.left = mi.rcMonitor.left;
+        b.top = mi.rcMonitor.top;
+        b.width = mi.rcMonitor.right - mi.rcMonitor.left;
+        b.height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        b.is_primary = ((mi.dwFlags & MONITORINFOF_PRIMARY) != 0);
+        list->push_back(b);
+    }
+    return TRUE;
+}
+
+void UpdateStatusText() noexcept {
+    if (!g_hwnd) return;
+    int cur_w = (g_disp_w > 0) ? g_disp_w : GetSystemMetrics(SM_CXSCREEN);
+    int cur_h = (g_disp_h > 0) ? g_disp_h : GetSystemMetrics(SM_CYSCREEN);
+
+    std::string title = "osu!Point v0.2.1 - [" + g_spec.name + "] - [" + std::to_string(cur_w) + "x" + std::to_string(cur_h) + "]";
+    SetWindowTextA(g_hwnd, title.c_str());
+    strncpy_s(g_nid.szTip, title.c_str(), sizeof(g_nid.szTip) - 1);
+    Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+}
+
+void UpdateTargetMonitor() {
+    int mon_w = GetSystemMetrics(SM_CXSCREEN);
+    int mon_h = GetSystemMetrics(SM_CYSCREEN);
+    int mon_l = 0;
+    int mon_t = 0;
+    bool is_primary = true;
+
+    if (g_target_monitor_idx > 0) {
+        std::vector<MonitorBounds> monitors;
+        EnumDisplayMonitors(nullptr, nullptr, EnumMonitorsProc, reinterpret_cast<LPARAM>(&monitors));
+        if (g_target_monitor_idx <= static_cast<int>(monitors.size())) {
+            const auto& target = monitors[g_target_monitor_idx - 1];
+            mon_l = target.left;
+            mon_t = target.top;
+            mon_w = target.width;
+            mon_h = target.height;
+            is_primary = target.is_primary;
+        }
+    }
+
+    double eff_w = (g_disp_w > 0) ? static_cast<double>(g_disp_w) : static_cast<double>(mon_w);
+    double eff_h = (g_disp_h > 0) ? static_cast<double>(g_disp_h) : static_cast<double>(mon_h);
+
+    eff_w = (std::min)(static_cast<double>(mon_w), (std::max)(2.0, eff_w));
+    eff_h = (std::min)(static_cast<double>(mon_h), (std::max)(2.0, eff_h));
+
+    double off_x = (g_disp_x >= 0) ? static_cast<double>(g_disp_x) : (static_cast<double>(mon_w) - eff_w) * 0.5;
+    double off_y = (g_disp_y >= 0) ? static_cast<double>(g_disp_y) : (static_cast<double>(mon_h) - eff_h) * 0.5;
+
+    off_x = (std::max)(0.0, (std::min)(static_cast<double>(mon_w) - eff_w, off_x));
+    off_y = (std::max)(0.0, (std::min)(static_cast<double>(mon_h) - eff_h, off_y));
+
+    if (is_primary) {
+        double denom_x = (mon_w > 1) ? (mon_w - 1.0) : 1.0;
+        double denom_y = (mon_h > 1) ? (mon_h - 1.0) : 1.0;
+
+        double scale_x = (eff_w - 1.0) * 65535.0 / denom_x;
+        double offset_x = off_x * 65535.0 / denom_x;
+        double scale_y = (eff_h - 1.0) * 65535.0 / denom_y;
+        double offset_y = off_y * 65535.0 / denom_y;
+
+        g_targetMon.scale_dx.store(scale_x, std::memory_order_relaxed);
+        g_targetMon.offset_dx.store(offset_x, std::memory_order_relaxed);
+        g_targetMon.scale_dy.store(scale_y, std::memory_order_relaxed);
+        g_targetMon.offset_dy.store(offset_y, std::memory_order_relaxed);
+        g_targetMon.mouse_flags.store(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, std::memory_order_release);
+    }
+    else {
+        int vl = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vt = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        double denom_x = (vw > 1) ? (vw - 1.0) : 1.0;
+        double denom_y = (vh > 1) ? (vh - 1.0) : 1.0;
+
+        double scale_x = (eff_w - 1.0) * 65535.0 / denom_x;
+        double offset_x = (mon_l + off_x - vl) * 65535.0 / denom_x;
+        double scale_y = (eff_h - 1.0) * 65535.0 / denom_y;
+        double offset_y = (mon_t + off_y - vt) * 65535.0 / denom_y;
+
+        g_targetMon.scale_dx.store(scale_x, std::memory_order_relaxed);
+        g_targetMon.offset_dx.store(offset_x, std::memory_order_relaxed);
+        g_targetMon.scale_dy.store(scale_y, std::memory_order_relaxed);
+        g_targetMon.offset_dy.store(offset_y, std::memory_order_relaxed);
+        g_targetMon.mouse_flags.store(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, std::memory_order_release);
+    }
+}
+
 std::string GetExeDirectory() {
     char exePath[MAX_PATH];
     GetModuleFileNameA(NULL, exePath, MAX_PATH);
@@ -139,7 +334,7 @@ std::string GetExeDirectory() {
     return std::string(exePath);
 }
 
-USHORT ParseHexOrDec(const std::string& str) {
+USHORT ParseHexOrDec(const std::string& str) noexcept {
     if (str.rfind("0x", 0) == 0 || str.rfind("0X", 0) == 0) {
         return static_cast<USHORT>(std::strtoul(str.c_str(), nullptr, 16));
     }
@@ -154,12 +349,13 @@ bool LoadTabletProfile(const std::string& filepath, TabletSpec& spec) {
     spec.init_feature.clear();
 
     while (std::getline(f, line)) {
+        line = Trim(line);
         if (line.empty() || line[0] == '#' || line[0] == ';') continue;
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
 
-        std::string key = line.substr(0, eq);
-        std::string val = line.substr(eq + 1);
+        std::string key = ToLower(Trim(line.substr(0, eq)));
+        std::string val = Trim(line.substr(eq + 1));
 
         if (key == "name") spec.name = val;
         else if (key == "vid") spec.vid = ParseHexOrDec(val);
@@ -289,19 +485,34 @@ std::string DetectAndInitTablet() {
 
 void SaveConfig() {
     if (!g_guiReady) return;
-    std::ofstream f(g_baseDir + "config.ini");
+    std::string cfgPath = g_baseDir + "config.ini";
+    std::ofstream f(cfgPath);
     if (!f.is_open()) return;
 
+    f << "# osu!Point Configuration v0.2.1\n";
     f << "width=" << g_cfg.width_mm.load() << "\n";
     f << "height=" << g_cfg.height_mm.load() << "\n";
     f << "center_x=" << g_cfg.center_x_mm.load() << "\n";
     f << "center_y=" << g_cfg.center_y_mm.load() << "\n";
     f << "rotation=" << g_cfg.rotation_deg.load() << "\n";
+    f << "monitor=" << g_target_monitor_idx << "\n";
+    f << "display_width=" << g_disp_w << "\n";
+    f << "display_height=" << g_disp_h << "\n";
+    f << "display_x=" << g_disp_x << "\n";
+    f << "display_y=" << g_disp_y << "\n";
+    f.close();
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(cfgPath.c_str(), GetFileExInfoStandard, &fad)) {
+        g_lastConfigTime = fad.ftLastWriteTime;
+    }
 }
 
-void SetDefaults() {
+void SetDefaults() noexcept {
     g_cfg.width_mm = g_spec.phys_w;
     g_cfg.height_mm = g_spec.phys_h;
+    g_cfg.inv_width = 1.0 / (g_spec.phys_w > 0.0 ? g_spec.phys_w : 1.0);
+    g_cfg.inv_height = 1.0 / (g_spec.phys_h > 0.0 ? g_spec.phys_h : 1.0);
     g_cfg.center_x_mm = g_spec.phys_w * 0.5;
     g_cfg.center_y_mm = g_spec.phys_h * 0.5;
     g_cfg.rotation_deg = 0.0;
@@ -310,28 +521,48 @@ void SetDefaults() {
 }
 
 void LoadConfig() {
-    std::ifstream f(g_baseDir + "config.ini");
+    std::string cfgPath = g_baseDir + "config.ini";
+    std::ifstream f(cfgPath);
     if (!f.is_open()) {
         SetDefaults();
+        UpdateTargetMonitor();
         return;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(cfgPath.c_str(), GetFileExInfoStandard, &fad)) {
+        g_lastConfigTime = fad.ftLastWriteTime;
     }
 
     std::string line;
     double w = 0, h = 0, cx = 0, cy = 0, rot = 0;
+    int mon = 0;
     bool has_w = false, has_h = false, has_cx = false, has_cy = false;
 
     while (std::getline(f, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';' || (line.size() >= 2 && line[0] == '/' && line[1] == '/')) continue;
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
-        std::string key = line.substr(0, eq);
-        double val = atof(line.substr(eq + 1).c_str());
+
+        std::string key = ToLower(Trim(line.substr(0, eq)));
+        std::string valStr = Trim(line.substr(eq + 1));
+        double val = atof(valStr.c_str());
 
         if (key == "width") { w = val; has_w = true; }
         else if (key == "height") { h = val; has_h = true; }
         else if (key == "center_x") { cx = val; has_cx = true; }
         else if (key == "center_y") { cy = val; has_cy = true; }
         else if (key == "rotation") { rot = val; }
+        else if (key == "monitor") { mon = std::atoi(valStr.c_str()); }
+        else if (key == "display_width" || key == "screen_width" || key == "disp_w") { g_disp_w = std::atoi(valStr.c_str()); }
+        else if (key == "display_height" || key == "screen_height" || key == "disp_h") { g_disp_h = std::atoi(valStr.c_str()); }
+        else if (key == "display_x" || key == "screen_x" || key == "display_offset_x" || key == "disp_x") { g_disp_x = std::atoi(valStr.c_str()); }
+        else if (key == "display_y" || key == "screen_y" || key == "display_offset_y" || key == "disp_y") { g_disp_y = std::atoi(valStr.c_str()); }
     }
+
+    g_target_monitor_idx = mon;
+    UpdateTargetMonitor();
 
     if (!has_w || !has_h || !has_cx || !has_cy || w <= 0 || h <= 0 || cx <= 0 || cy <= 0) {
         SetDefaults();
@@ -339,6 +570,8 @@ void LoadConfig() {
     else {
         g_cfg.width_mm = w;
         g_cfg.height_mm = h;
+        g_cfg.inv_width = 1.0 / w;
+        g_cfg.inv_height = 1.0 / h;
         g_cfg.center_x_mm = cx;
         g_cfg.center_y_mm = cy;
         g_cfg.rotation_deg = rot;
@@ -346,14 +579,43 @@ void LoadConfig() {
         g_cfg.cos_val = std::cos(rad);
         g_cfg.sin_val = std::sin(rad);
     }
+    UpdateStatusText();
 }
 
-void UpdateStatusText(const std::string& status) {
-    if (g_hwnd) {
-        std::string title = "osu!Point - [" + status + "]";
-        SetWindowTextA(g_hwnd, title.c_str());
-        strncpy_s(g_nid.szTip, title.c_str(), sizeof(g_nid.szTip) - 1);
-        Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+HWND hW, hH, hCX, hCY, hRot;
+
+std::string FormatDouble(double v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f", v);
+    std::string s = buf;
+    if (s.find('.') != std::string::npos) {
+        while (s.back() == '0') s.pop_back();
+        if (s.back() == '.') s.pop_back();
+    }
+    return s;
+}
+
+void CheckConfigFileReload() {
+    std::string cfgPath = g_baseDir + "config.ini";
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(cfgPath.c_str(), GetFileExInfoStandard, &fad)) {
+        if (fad.ftLastWriteTime.dwLowDateTime != g_lastConfigTime.dwLowDateTime ||
+            fad.ftLastWriteTime.dwHighDateTime != g_lastConfigTime.dwHighDateTime) {
+
+            g_lastConfigTime = fad.ftLastWriteTime;
+            LoadConfig();
+
+            bool prevReady = g_guiReady;
+            g_guiReady = false;
+            if (hW) SetWindowTextA(hW, FormatDouble(g_cfg.width_mm.load()).c_str());
+            if (hH) SetWindowTextA(hH, FormatDouble(g_cfg.height_mm.load()).c_str());
+            if (hCX) SetWindowTextA(hCX, FormatDouble(g_cfg.center_x_mm.load()).c_str());
+            if (hCY) SetWindowTextA(hCY, FormatDouble(g_cfg.center_y_mm.load()).c_str());
+            if (hRot) SetWindowTextA(hRot, FormatDouble(g_cfg.rotation_deg.load()).c_str());
+            g_guiReady = prevReady;
+
+            if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+        }
     }
 }
 
@@ -365,9 +627,9 @@ inline uint16_t ReadLE16(const BYTE* ptr) noexcept {
 
 void DriverThread() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    SetThreadAffinityMask(GetCurrentThread(), (1ULL << 2));
-
-    DisablePowerThrottling();
+    DisableProcessPowerThrottlingLocally();
+    SetOptimalThreadAffinityLocally();
+    SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_CONTINUOUS);
 
     DWORD taskIndex = 0;
     HANDLE hMmcss = AvSetMmThreadCharacteristicsA("Pro Audio", &taskIndex);
@@ -380,28 +642,30 @@ void DriverThread() {
 
     INPUT mouseInput = { 0 };
     mouseInput.type = INPUT_MOUSE;
-    mouseInput.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+
+    LONG last_dx = -1;
+    LONG last_dy = -1;
 
     while (g_running) {
         if (g_hDevice == INVALID_HANDLE_VALUE) {
             std::string devPath = DetectAndInitTablet();
             if (devPath.empty()) {
-                UpdateStatusText("Waiting for tablet...");
+                if (g_hwnd) SetWindowTextA(g_hwnd, "osu!Point v0.2.1 - [Waiting for tablet...]");
                 Sleep(300);
                 continue;
             }
 
             g_hDevice = CreateFileA(devPath.c_str(), GENERIC_READ | GENERIC_WRITE,
-                0, nullptr, OPEN_EXISTING, 0, nullptr);
+                0, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
 
             if (g_hDevice == INVALID_HANDLE_VALUE) {
                 g_hDevice = CreateFileA(devPath.c_str(), GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
             }
 
             if (g_hDevice == INVALID_HANDLE_VALUE) {
                 g_hDevice = CreateFileA(devPath.c_str(), GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
             }
 
             if (g_hDevice == INVALID_HANDLE_VALUE) {
@@ -415,10 +679,10 @@ void DriverThread() {
                 HidD_SetFeature(g_hDevice, g_spec.init_feature.data(), static_cast<ULONG>(g_spec.init_feature.size()));
             }
 
-            UpdateStatusText(g_spec.name);
+            UpdateStatusText();
         }
 
-        if (!ReadFile(g_hDevice, rawReportBuffer, sizeof(rawReportBuffer), &bytesRead, nullptr) || bytesRead == 0) {
+        if (!ReadFile(g_hDevice, rawReportBuffer, sizeof(rawReportBuffer), &bytesRead, nullptr) || bytesRead == 0) [[unlikely]] {
             CloseHandle(g_hDevice);
             g_hDevice = INVALID_HANDLE_VALUE;
             Sleep(150);
@@ -434,8 +698,8 @@ void DriverThread() {
         const int max_x = g_spec.max_x;
         const int max_y = g_spec.max_y;
 
-        if (req_id == 0 || report[0] == req_id || report[0] == 0x10) {
-            if (xo + 2 <= static_cast<int>(report.size()) && yo + 2 <= static_cast<int>(report.size())) {
+        if (req_id == 0 || report[0] == req_id || report[0] == 0x10) [[likely]] {
+            if (xo + 2 <= static_cast<int>(report.size()) && yo + 2 <= static_cast<int>(report.size())) [[likely]] {
                 raw_x = ReadLE16(&report[xo]);
                 raw_y = ReadLE16(&report[yo]);
             }
@@ -447,16 +711,17 @@ void DriverThread() {
             }
         }
 
-        if (raw_x == 0 && raw_y == 0) continue;
-        if (raw_x > max_x || raw_y > max_y) continue;
+        if ((raw_x == 0 && raw_y == 0) || raw_x > max_x || raw_y > max_y) [[unlikely]] {
+            continue;
+        }
 
         double px = static_cast<double>(raw_x) * g_inv_scale_x;
         double py = static_cast<double>(raw_y) * g_inv_scale_y;
 
         double cx = g_cfg.center_x_mm.load(std::memory_order_relaxed);
         double cy = g_cfg.center_y_mm.load(std::memory_order_relaxed);
-        double w = g_cfg.width_mm.load(std::memory_order_relaxed);
-        double h = g_cfg.height_mm.load(std::memory_order_relaxed);
+        double inv_w = g_cfg.inv_width.load(std::memory_order_relaxed);
+        double inv_h = g_cfg.inv_height.load(std::memory_order_relaxed);
         double cos_r = g_cfg.cos_val.load(std::memory_order_relaxed);
         double sin_r = g_cfg.sin_val.load(std::memory_order_relaxed);
 
@@ -465,21 +730,28 @@ void DriverThread() {
         double lx = dx * cos_r - dy * sin_r;
         double ly = dx * sin_r + dy * cos_r;
 
-        double half_w = w * 0.5;
-        double half_h = h * 0.5;
+        double norm_x = std::clamp(lx * inv_w + 0.5, 0.0, 1.0);
+        double norm_y = std::clamp(ly * inv_h + 0.5, 0.0, 1.0);
 
-        double cl_x = (std::max)(-half_w, (std::min)(half_w, lx));
-        double cl_y = (std::max)(-half_h, (std::min)(half_h, ly));
-
-        double norm_x = (cl_x + half_w) / w;
-        double norm_y = (cl_y + half_h) / h;
-
-        if (std::isnan(norm_x) || std::isnan(norm_y) || std::isinf(norm_x) || std::isinf(norm_y)) {
+        if (std::isnan(norm_x) || std::isnan(norm_y)) [[unlikely]] {
             continue;
         }
 
-        mouseInput.mi.dx = static_cast<LONG>(norm_x * 65535.0);
-        mouseInput.mi.dy = static_cast<LONG>(norm_y * 65535.0);
+        double raw_dx = norm_x * g_targetMon.scale_dx.load(std::memory_order_relaxed) + g_targetMon.offset_dx.load(std::memory_order_relaxed);
+        double raw_dy = norm_y * g_targetMon.scale_dy.load(std::memory_order_relaxed) + g_targetMon.offset_dy.load(std::memory_order_relaxed);
+
+        LONG cur_dx = static_cast<LONG>(std::clamp(raw_dx, 0.0, 65535.0));
+        LONG cur_dy = static_cast<LONG>(std::clamp(raw_dy, 0.0, 65535.0));
+
+        if (cur_dx == last_dx && cur_dy == last_dy) [[unlikely]] {
+            continue;
+        }
+        last_dx = cur_dx;
+        last_dy = cur_dy;
+
+        mouseInput.mi.dwFlags = g_targetMon.mouse_flags.load(std::memory_order_relaxed);
+        mouseInput.mi.dx = cur_dx;
+        mouseInput.mi.dy = cur_dy;
 
         SendInput(1, &mouseInput, sizeof(INPUT));
     }
@@ -487,6 +759,7 @@ void DriverThread() {
     if (hMmcss) {
         AvRevertMmThreadCharacteristics(hMmcss);
     }
+    SetThreadExecutionState(ES_CONTINUOUS);
 }
 
 double ParseInput(HWND hEdit) {
@@ -497,19 +770,6 @@ double ParseInput(HWND hEdit) {
     }
     return atof(buf);
 }
-
-std::string FormatDouble(double v) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.2f", v);
-    std::string s = buf;
-    if (s.find('.') != std::string::npos) {
-        while (s.back() == '0') s.pop_back();
-        if (s.back() == '.') s.pop_back();
-    }
-    return s;
-}
-
-HWND hW, hH, hCX, hCY, hRot;
 
 void UpdateValues() {
     if (!g_guiReady) return;
@@ -555,6 +815,8 @@ void UpdateValues() {
 
     g_cfg.width_mm = w;
     g_cfg.height_mm = h;
+    g_cfg.inv_width = 1.0 / w;
+    g_cfg.inv_height = 1.0 / h;
     g_cfg.center_x_mm = cx;
     g_cfg.center_y_mm = cy;
     g_cfg.rotation_deg = rot_deg;
@@ -731,6 +993,7 @@ void RestoreWindow(HWND hwnd) {
 
 void KillProcessNow() {
     g_running = false;
+    if (g_hwnd) KillTimer(g_hwnd, 1);
     DisableSubMillisecondTimer();
     SaveConfig();
 
@@ -748,6 +1011,21 @@ void KillProcessNow() {
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DISPLAYCHANGE) {
+        UpdateTargetMonitor();
+        UpdateStatusText();
+        return 0;
+    }
+
+    if (msg == WM_TIMER && wParam == 1) {
+        CheckConfigFileReload();
+        return 0;
+    }
+
+    if (msg == WM_ACTIVATE && LOWORD(wParam) != WA_INACTIVE) {
+        CheckConfigFileReload();
+    }
+
     if (msg == WM_SYSCOMMAND && (wParam & 0xFFF0) == SC_MINIMIZE) {
         ShowWindow(hwnd, SW_HIDE);
         return 0;
@@ -842,8 +1120,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
+    EnablePerMonitorDpi();
     EnableSubMillisecondTimer();
     SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+    DisableProcessPowerThrottlingLocally();
 
     g_baseDir = GetExeDirectory();
     DetectAndInitTablet();
@@ -862,7 +1142,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     wc.lpszClassName = "osuPoint_Driver";
     RegisterClassA(&wc);
 
-    std::string title = "osu!Point - [" + g_spec.name + "]";
+    int cur_w = (g_disp_w > 0) ? g_disp_w : GetSystemMetrics(SM_CXSCREEN);
+    int cur_h = (g_disp_h > 0) ? g_disp_h : GetSystemMetrics(SM_CYSCREEN);
+    std::string title = "osu!Point v0.2.1 - [" + g_spec.name + "] - [" + std::to_string(cur_w) + "x" + std::to_string(cur_h) + "]";
+
     g_hwnd = CreateWindowA("osuPoint_Driver", title.c_str(),
         WS_OVERLAPPEDWINDOW ^ (WS_THICKFRAME | WS_MAXIMIZEBOX),
         CW_USEDEFAULT, CW_USEDEFAULT, 470, 240, NULL, NULL, hInst, NULL);
@@ -911,6 +1194,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
     g_guiReady = true;
     UpdateValues();
+
+    SetTimer(g_hwnd, 1, 200, NULL);
 
     ShowWindow(g_hwnd, nCmdShow);
 

@@ -1,0 +1,66 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+      release_title:
+        description: 'Release title (optional, defaults to tag)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # 1. Build standard non-AVX binary
+      - name: Build Standard
+        shell: cmd
+        run: |
+          cl.exe /O2 /Oi /Ot /GL /Gw /Gy /fp:fast /EHsc /GS- /GR- /std:c++20 /utf-8 /DNDEBUG /Fe:osuPoint.exe osuPoint.cpp /link /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS
+          mkdir dist-standard
+          move osuPoint.exe dist-standard\
+          xcopy /E /I /Y tablets dist-standard\tablets
+
+      # 2. Build AVX2 optimized binary
+      - name: Build AVX2
+        shell: cmd
+        run: |
+          cl.exe /O2 /Oi /Ot /GL /Gw /Gy /fp:fast /arch:AVX2 /EHsc /GS- /GR- /std:c++20 /utf-8 /DNDEBUG /Fe:osuPoint.exe osuPoint.cpp /link /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS
+          mkdir dist-avx2
+          move osuPoint_avx2.exe dist-avx2\
+          xcopy /E /I /Y tablets dist-avx2\tablets
+
+      # 3. Create ZIP archives without version/arch suffixes
+      - name: Create ZIP archives
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist-standard\* -DestinationPath "osuPoint-standard.zip"
+          Compress-Archive -Path dist-avx2\* -DestinationPath "osuPoint-avx2.zip"
+
+      # 4. Create GitHub Release and upload assets
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: ${{ inputs.release_title != '' && inputs.release_title || inputs.tag_name }}
+          draft: false
+          prerelease: false
+          files: |
+            osuPoint-standard.zip
+            osuPoint-avx2.zip

@@ -4,6 +4,14 @@ A high-performance, ultra-low-latency drawing tablet driver built specifically f
 
 ---
 
+## Author's Note
+
+I am a beginner developer, and I actively collaborated with AI to design, architect, and write this application. Even with the assistance of AI, I am putting my absolute best effort into refining this project, thoroughly testing its stability, and ensuring it delivers a truly competitive, top-tier ultra-low-latency experience.
+
+My primary goal and dedication is to improve the rhythm game experience and eliminate latency for anyone who wants to get the most responsive tablet gameplay possible. Any feedback, testing, bug reports, or community contributions are warmly welcomed!
+
+---
+
 ## What's New in v0.2.1
 
 * **Multi-Monitor Display Arbitrage:** Fixed the issue where absolute coordinates stretched across multiple monitors or glitched when cursor crossed display boundaries. By default, coordinates map strictly to the Primary Monitor (`MOUSEEVENTF_ABSOLUTE`), with optional support for dedicated secondary monitors (`monitor=N`).

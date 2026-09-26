@@ -35,7 +35,6 @@ jobs:
           cl.exe /nologo /O2 /Ob3 /Ot /GL /Gy /Zc:inline /std:c++20 /fp:precise /DNDEBUG /GS- /GR- /EHs-c- /MT /Gw /utf-8 osupoint.cpp osuPoint.res /Fe:osuPoint.exe /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
           mkdir dist-standard
           move osuPoint.exe dist-standard\
-          xcopy /E /I /Y tablets dist-standard\tablets
 
       # 2. Build AVX2 optimized binary
       - name: Build AVX2
@@ -44,7 +43,6 @@ jobs:
           cl.exe /nologo /O2 /Ob3 /Ot /GL /Gy /Zc:inline /std:c++20 /arch:AVX2 /fp:precise /DNDEBUG /GS- /GR- /EHs-c- /MT /Gw /utf-8 osupoint.cpp osuPoint.res /Fe:osuPoint.exe /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
           mkdir dist-avx2
           move osuPoint.exe dist-avx2\
-          xcopy /E /I /Y tablets dist-avx2\tablets
 
       # 3. Create ZIP archives without version/arch suffixes
       - name: Create ZIP archives

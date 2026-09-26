@@ -1,233 +1,89 @@
 # osu!Point
 
-A high-performance, ultra-low-latency drawing tablet driver built specifically for osu!, written in pure C++20. It communicates directly with USB HID devices in user-mode, requires no kernel drivers, digital signatures, or registry tweaks, and delivers true 1000 Hz+ report rates with zero garbage collection and sub-microsecond software overhead.
+A lightweight, low-latency drawing tablet driver for osu!, written in C++20. It communicates directly with USB HID devices in user-mode without virtual mouse drivers (VMulti), background services, or runtime garbage collection.
 
 ---
 
-## Author's Note
+## Features
 
-I am a beginner developer, and I actively collaborated with AI to design, architect, and write this application. Even with the assistance of AI, I am putting my absolute best effort into refining this project, thoroughly testing its stability, and ensuring it delivers a truly competitive, top-tier ultra-low-latency experience.
-
-My primary goal and dedication is to improve the rhythm game experience and eliminate latency for anyone who wants to get the most responsive tablet gameplay possible. Any feedback, testing, bug reports, or community contributions are warmly welcomed!
-
----
-
-## What's New in v0.2.1
-
-* **Multi-Monitor Display Arbitrage:** Fixed the issue where absolute coordinates stretched across multiple monitors or glitched when cursor crossed display boundaries. By default, coordinates map strictly to the Primary Monitor (`MOUSEEVENTF_ABSOLUTE`), with optional support for dedicated secondary monitors (`monitor=N`).
-* **Letterboxing & Custom Display Area:** Full native support for custom in-game viewports (e.g. `1280x1024`, `1024x768`, `1440x900`) via `config.ini`. The tablet's active area is mapped 1:1 to your letterboxed osu! window, eliminating black-bar distortion.
-* **Instant Config Hot-Reload:** Edit your area or display settings in `config.ini` and save (`Ctrl+S`) — changes take effect in real time without restarting the app.
-* **Zero-Footprint In-Memory Architecture:** All low-latency execution privileges (MMCSS Pro Audio, 0.5 ms timer locks, Windows 11 EcoQoS bypass, USB stay-awake state) are managed purely in RAM. Your system registry and global settings remain 100% stock.
-* **Syscall Deduplication:** Automatically filters out redundant `SendInput` calls when the pen is held still, reducing CPU overhead by up to 70% during pauses.
-* **10 New Tablet Profiles Added:** Added out-of-the-box support for Wacom CTH-690, CTH-460; XP-Pen Deco 01 V2, Star G430, Star 03; Huion Inspiroy H950P, New 1060 Plus; Gaomon M10K; VEIKK A30, A50 (and documented existing CTH-680, Deco Mini7, HS64, VK430, S56K).
-* **Dual Release Builds:** Distributed as both a **Universal Build** (runs on 100% of 64-bit CPUs) and an **AVX2 Edition** (hardware-fused FMA acceleration for modern CPUs).
+* **Direct HID Communication:** Reads raw reports directly via Win32 HID APIs, bypassing virtual kernel emulation layers.
+* **Dual-Core Real-Time Pipeline:** HID reading and coordinate processing run on two dedicated threads, each pinned to a separate physical P-core (with automatic hybrid-CPU detection) to eliminate scheduling contention between them.
+* **SIMD Coordinate Transform:** Rotation, scaling, and multi-monitor mapping are evaluated with vectorized (SSE2/AVX2/FMA) dual-axis math on the hot path.
+* **Adaptive Input Queue:** The primary coordinate endpoint is kept shallow (4 buffered packets) to avoid backlog, while auxiliary endpoints on multi-interface tablets get deeper buffering (16) without affecting movement latency.
+* **Zero Runtime Overhead:** No garbage collector, zero dynamic allocations in the input loop.
+* **Real-Time Priority:** Uses MMCSS Pro Audio thread scheduling and locks kernel timer resolution to 0.5 ms.
+* **Broad Hardware Compatibility:** Ships with a built-in database of 160+ tablet configurations (ported from OpenTabletDriver) covering Wacom, XP-Pen, Huion, Gaomon, VEIKK, and more — no manual `.cfg` file needed for most tablets. Automatic interface scoring picks the correct digitizer/vendor/mouse endpoint out of everything a tablet exposes.
+* **Multi-Endpoint Support:** Tablets that split pen data and auxiliary controls (buttons, wheel) across separate USB interfaces are read from up to 4 endpoints in parallel.
+* **Toggleable Pen Click:** Enable or disable the pen tip click independently of cursor movement — from the settings window or the tray icon — for tracking practice or when you want the tablet as a pure pointing device. Includes stuck-click protection for abrupt pen lifts.
+* **Conflicting Driver Detection:** Automatically detects other tablet drivers (OpenTabletDriver, PenTablet, etc.) still running in the background and flags it in the window title/tray tooltip.
+* **Letterboxing & Multi-Monitor:** Native absolute mapping to primary/secondary monitors and letterboxed osu! resolutions without aspect-ratio warping.
+* **Clip Area:** Optional hard-clip of the cursor at the configured active-area border, instead of free-tracking past it.
+* **Live Hot-Reload:** Updates active area and display settings from `config.ini` in real time without restarting.
 
 ---
 
-## Empirical Latency Benchmark (480 FPS Camera Test)
+## Latency Benchmark (480 FPS)
 
-To empirically verify the end-to-end latency difference between **osu!Point v0.2.1** and **OpenTabletDriver v0.6.7**, high-speed video capture measurements were conducted.
+High-speed camera test measuring input lag from physical pen movement to the first on-screen cursor response.
 
-### Test Environment
-* **Capture Rate:** 480 FPS (1 frame = 2.0833 ms)
-* **Display Refresh Rate:** 157 Hz (display refresh interval = 6.37 ms)
-* **Tablet Hardware:** Wacom One CTL-472 (overclocked firmware at 700 Hz)
-* **Measurement Method:** Physical pen motion onset $\to$ first on-screen pixel movement.
+### Test Setup
+* **Camera:** 480 FPS (1 frame ≈ 2.08 ms)
+* **Monitor:** 240 Hz (~4.17 ms frame interval)
+* **Tablet:** Wacom One CTL-472 (700 Hz firmware)
+* **Analysis Tool:** Kinovea
 
-### Benchmark Data
+### Results
 
-| Sample # | OpenTabletDriver v0.6.7 (Frames / ms) | osu!Point v0.2.1 (Frames / ms) |
-| :---: | :---: | :---: |
-| **Run 1** | 9 frames (18.75 ms) | 6 frames (12.50 ms) |
-| **Run 2** | 7 frames (14.58 ms) | 5 frames (10.42 ms) |
-| **Run 3** | 7 frames (14.58 ms) | 6 frames (12.50 ms) |
-| **Run 4** | 7 frames (14.58 ms) | 4 frames (8.33 ms) |
-| **Average** | **7.50 frames (15.63 ms)** | **5.25 frames (10.94 ms)** |
-| **Jitter / Range** | 14.58 ms – 18.75 ms ($\Delta$ 4.17 ms) | 8.33 ms – 12.50 ms ($\Delta$ 4.17 ms) |
+| Sample | OpenTabletDriver v0.6.7 | osu!Point v0.4.0 |
+| :--- | :---: | :---: |
+| **Run 1** | 5 frames (10.42 ms) | 5 frames (10.42 ms) |
+| **Run 2** | 4 frames (8.33 ms) | 4 frames (8.33 ms) |
+| **Run 3** | 4 frames (8.33 ms) | 3 frames (6.25 ms) |
+| **Run 4** | 5 frames (10.42 ms) | 3 frames (6.25 ms) |
+| **Average** | **4.50 frames (9.38 ms)** | **3.75 frames (7.81 ms)** |
+| **Range** | 8.33 – 10.42 ms ($\Delta$ 2.08 ms) | 6.25 – 10.42 ms ($\Delta$ 4.17 ms) |
 
-### Key Findings & Technical Analysis
-1. **4.69 ms (30.0%) Latency Reduction:** osu!Point responds **2.25 camera frames faster** on average, reducing total end-to-end latency by 30.0% compared to OpenTabletDriver.
-2. **Identical Jitter (Display Phase):** Both drivers show an exact 4.17 ms (2 frames) spread, verifying that jitter is driven by 157 Hz display refresh quantization, not driver instability.
-3. **Pipeline Efficiency:** Bypassing .NET GC overhead, eliminating virtual driver hops, and capping kernel queues at 2 reports (`HidD_SetNumInputBuffers(2)`) directly cuts ~4.7 ms of system latency.
-
----
-
-## Why does this exist?
-
-Most osu! players rely on OpenTabletDriver (OTD). While OTD is a great project with broad hardware compatibility, it is built on C# (.NET Core). That architecture introduces several inherent drawbacks for competitive rhythm gameplay:
-* **Garbage Collector (GC) pauses:** Periodic background memory sweeps that can cause subtle frame time spikes and micro-stutters;
-* **Virtualization overhead:** Routing movement through virtual kernel mouse drivers (VMulti), adding an extra queue to the input pipeline;
-* **Resource consumption:** Consumes 50 to 150 MB of RAM with 0.5 to 1.5 ms of software latency.
-
-**osu!Point** eliminates all intermediate layers. It contains no jitter smoothing, no pressure tracking, and no background runtimes. The polling thread reads raw hardware packets, applies precalculated coordinate transformations, and injects clean mouse events in under 50 nanoseconds.
-
----
-
-## Comparison
-
-| Metric | Official Wacom Driver | OpenTabletDriver | osu!Point v0.2.1 |
-| :--- | :--- | :--- | :--- |
-| **End-to-End Latency (Measured)** | ~25–35 ms | 15.63 ms | **10.94 ms (-30%)** |
-| **Language / Runtime** | C++ / Background Services | C# (.NET Core) | **Native C++20 (Portable)** |
-| **Garbage Collector (GC)** | None | Yes (.NET GC Spikes) | **None (Zero Allocations)** |
-| **Kernel Buffer Depth (`hidclass.sys`)** | 32 reports (Lag backlog) | 32 reports | **2 reports (Zero Buffer Lag)** |
-| **Windows 11 EcoQoS** | Throttled in background | Throttled in background | **Bypassed in Process RAM** |
-| **Kernel Scheduling** | Normal | Standard Threading | **MMCSS Pro Audio (Critical)** |
-| **Multi-Monitor Handling** | Varies | Virtual Desktop | **Direct Primary / Targeted Screen** |
-| **Letterboxing Support** | Manual Setup | Supported | **Native Auto-Center Viewport** |
-| **Memory Allocations per Packet** | Yes | Yes | **0 bytes (pure registers)** |
-| **RAM Usage** | ~200 MB | ~80 MB | **< 2.5 MB** |
-| **Binary Size** | ~150 MB | ~45 MB | **~300 KB (standalone .exe)** |
-| **Driver / Kernel Cert Required** | Yes | Yes (for VMulti output) | **None (User-Mode Win32)** |
-
----
-
-## Supported Tablets (43 Out-of-the-Box Models)
-
-The release archive includes pre-configured hardware profiles inside the `tablets/` directory. When launched, **osu!Point automatically detects your connected tablet via USB VID/PID** and loads its physical specs:
-
-### Wacom
-* **One by Wacom:** CTL-472, CTL-672, CTL-471
-* **Intuos (Classic):** CTL-480, CTH-480, CTH-680, CTL-490, CTH-690, CTL-4100, CTL-6100
-* **Bamboo:** CTL-470, CTH-460
-* **Intuos 4 & 5:** PTK-440, PTK-640, PTH-450, PTH-650
-* **Intuos Pro (Gen 1):** PTH-451, PTH-651, PTH-851
-* **Intuos Pro (Gen 2):** PTH-460, PTH-660, PTH-860
-
-### XP-Pen
-* **Star Series:** Star G640, Star G640S, Star G430, Star G430S, Star 03
-* **Deco Series:** Deco 01, Deco 01 V2, Deco Mini7
-
-### Gaomon
-* S620, S56K, M10K
-
-### Huion
-* 420, H420, HS64
-* Inspiroy H430P, Inspiroy H640P, Inspiroy H950P
-* New 1060 Plus
-
-### VEIKK
-* S640, VK430, A30, A50
-
----
-
-## Architecture & Key Features
-
-* **Kernel Queue Minimization:** Uses `HidD_SetNumInputBuffers` to reduce the internal Windows `hidclass.sys` input queue from 32 reports down to just **2 packets**. This eliminates the hidden 15–30 ms backlog latency that occurs when the OS buffers older reports during momentary frame dips.
-* **In-Memory Windows 11 EcoQoS Bypass:** Disables thread- and process-level execution throttling via native NT APIs (`SetProcessInformation` / `SetThreadInformation`), preventing Windows 11 from dropping CPU clock speeds or delegating the driver to efficiency cores.
-* **MMCSS Real-Time Audio Scheduling:** The USB polling thread is registered with the Windows Multimedia Class Scheduler Service (`AvSetMmThreadCharacteristicsA("Pro Audio")`) with `AVRT_PRIORITY_CRITICAL`. This bypasses standard OS thread scheduling decay and protects input polling from background interference.
-* **Multi-Monitor Coordinate Arbitrage:** Maps absolute cursor coordinates directly to the **Primary Monitor** (`MOUSEEVENTF_ABSOLUTE`), preventing cursor drifting or clipping conflicts across multi-display setups. Supports dedicated secondary displays via the `monitor` parameter.
-* **Letterboxing & Display Area Projection:** Full support for non-native in-game viewports (e.g. `1280x1024`, `1024x768`, `1440x900`). The tablet's active area is mapped 1:1 to your letterboxed osu! window without aspect ratio warping or black-bar deadzones.
-* **Instant Config Hot-Reload:** An integrated non-blocking file watcher monitors `config.ini` in the background. Editing values in Notepad and saving (`Ctrl+S`) immediately updates active area and display bounds in under 200 ms without restarting the driver.
-* **Hardware USB Stay-Awake:** Automatically issues `SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_CONTINUOUS)` during execution, preventing Windows from suspending or power-gating USB root hub endpoints.
-* **Syscall Deduplication:** Detects stationary cursor states and automatically skips redundant `SendInput` system calls, cutting CPU overhead by up to 70% during pauses while maintaining sub-50 nanosecond response on movement.
-* **Sub-Millisecond 0.5 ms Kernel Timers:** Calls undocumented NTAPI `NtSetTimerResolution` to lock the Windows kernel scheduling interval to 0.5 ms (5000 units of 100 ns), cutting timer quantization jitter in half.
-* **Precalculated Inverse Rotation:** Supports arbitrary rotation angles with decimal precision (e.g. `-3°` or `14.5°`). Trigonometric functions (`sin`/`cos`) are precomputed once on input; the tracking loop executes only fast additions and multiplications.
-* **Hardware Boundary Clamping:** The active area is mathematically bounded within physical tablet limits, preventing the cursor box from leaving the usable surface even under extreme rotation.
-* **Seamless Hot-Plug Engine:** Unplugging or reconnecting the tablet USB cable is handled gracefully without restarting the app and with flat 0.0% idle CPU consumption.
-* **Adaptive Thread Affinity:** The polling thread automatically avoids Core 0 (where DPC/ISR interrupt contention and system timers reside) and isolates execution onto Core 2 on multi-core architectures.
-
----
-
-## Release Package Structure
-
-When downloading the release archive, keep the executable and the `tablets/` folder together:
-
-```text
-osuPoint/
-├── osuPoint.exe            (Universal x64 Build — Recommended)
-├── osuPoint_avx2.exe       (AVX2 Performance Edition — Modern CPUs)
-├── config.ini              (Generated on first launch)
-└── tablets/
-    ├── Wacom_CTL-472.cfg
-    ├── Wacom_CTL-480.cfg
-    ├── XP-Pen_G640.cfg
-    ├── Gaomon_S620.cfg
-    └── ... (43 pre-built profiles)
-```
-
----
-
-## Configuration (`config.ini`)
-
-Upon launch, osu!Point automatically creates or updates `config.ini` in its directory. You can edit this file in real-time:
-
-```ini
-# osu!Point Configuration v0.2.1
-width=80.00
-height=50.00
-center_x=76.00
-center_y=47.50
-rotation=0
-monitor=0
-display_width=1280
-display_height=1024
-display_x=-1
-display_y=-1
-```
-
-### Parameter Reference
-
-| Key | Description | Default |
-| :--- | :--- | :--- |
-| `width`, `height` | Active tablet area dimensions in millimeters | Full tablet surface |
-| `center_x`, `center_y` | Center point of your active area in millimeters | Physical center |
-| `rotation` | Area rotation angle in degrees (e.g. `0`, `14.5`, `-3`) | `0` |
-| `monitor` | Target display index (`0` = Primary Monitor, `1` = Monitor 1, `2` = Monitor 2) | `0` (Primary) |
-| `display_width` | In-game viewport width in pixels (`0` = Full monitor width) | `0` |
-| `display_height` | In-game viewport height in pixels (`0` = Full monitor height) | `0` |
-| `display_x` | Viewport horizontal offset (`-1` = Auto-center for Letterboxing) | `-1` (Centered) |
-| `display_y` | Viewport vertical offset (`-1` = Auto-center for Letterboxing) | `-1` (Centered) |
+* **Latency:** osu!Point responds **~1.57 ms faster** on average (~17% reduction).
+* **Jitter:** The 2–4 ms variation between runs is driven by the 240 Hz monitor refresh intervals (4.17 ms per frame), not driver instability.
 
 ---
 
 ## Setup & In-Game Configuration
 
-### 1. System Preparation
-If official tablet software (e.g. Wacom Desktop Center) is installed, stop its background services:
-1. Open Task Manager $\to$ Services tab.
-2. Locate `WTabletServicePro` or `Wacom Professional Service` $\to$ Right-click $\to$ **Stop**.
+### 1. Close Existing Drivers
+Disable any running tablet software or background services (e.g. stop `WTabletServicePro` in Task Manager for Wacom, or exit OpenTabletDriver). osu!Point will flag a known conflicting driver process in its window title/tray tooltip if one is still running.
 
-### 2. Hardware Topology Tip (Lowest Hardware Latency)
-For the lowest physical latency, plug your tablet directly into the **rear motherboard USB ports routed to the CPU (Direct CPU Lanes)** rather than ports routed through the motherboard chipset (PCH) or external USB hubs/monitors.
-
-### 3. In-Game Settings (Critical)
+### 2. osu! Settings (Important)
 * **Raw Input: OFF.**
-  > **Why:** Windows pointer acceleration curves only affect *relative* mouse deltas ($\Delta X, \Delta Y$). Because osu!Point uses `MOUSEEVENTF_ABSOLUTE`, Windows applies **zero acceleration**—the mapping is 100% linear. Enabling Raw Input in osu! forces the game engine to interpret absolute coordinates as relative deltas, which can cause snapping or jitter.
+  osu!Point sends absolute coordinates (`MOUSEEVENTF_ABSOLUTE`), which Windows maps 1:1 without acceleration curves. Enabling Raw Input makes the game treat absolute coordinates as relative deltas, causing cursor snapping.
 * **Mouse Sensitivity: 1.0x.**
-  > Adjust your play area strictly inside osu!Point using millimeters.
-* **Screen Mode: Exclusive Fullscreen or Borderless.**
+  Adjust your play area strictly inside the osu!Point app or `config.ini`.
+
+  `config.ini` generated automatically on the first launch. Changes apply immediately upon saving the file.
+
+### 3. Pen Click
+Click synthesis from the pen tip can be toggled independently of movement — via the "Pen Click" checkbox in the app window, or the tray icon's right-click menu. Turn it off to use the tablet purely for cursor tracking (e.g. aim practice) without triggering clicks.
 
 ---
 
-## Building from Source
+## Supported Tablets
 
-You will need the Microsoft C++ compiler (MSVC), available through Visual Studio or Build Tools for Visual Studio.
+The driver auto-detects connected tablets in two stages:
 
-1. Open **x64 Native Tools Command Prompt for VS**.
-2. Navigate to the project directory:
-```cmd
-cd C:\path\to\osuPoint
-```
+1. **User profiles** — any `.cfg` file placed in the `tablets/` folder.
+2. **Built-in database** — 160+ configurations ported from OpenTabletDriver, matched automatically by device ID and, where several variants share an ID, by the tablet's own USB product name. No manual configuration required for these.
 
-### 1. Universal Build (Recommended — Compatible with any 64-bit PC)
-```cmd
-cl.exe /nologo /O2 /Ob3 /GL /std:c++20 /fp:precise /DNDEBUG /GS- /GR- /EHs-c- driver.cpp /Fe:osuPoint.exe /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
-```
+Tested and confirmed working:
 
-### 2. AVX2 Performance Edition (Intel Haswell / AMD Ryzen or newer)
-```cmd
-cl.exe /nologo /O2 /Ob3 /GL /std:c++20 /arch:AVX2 /fp:precise /DNDEBUG /GS- /GR- /EHs-c- driver.cpp /Fe:osuPoint_avx2.exe /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
-```
+* **Wacom:** CTL-472, CTL-471, and the wider CTL/CTH/CTE/Intuos family via the built-in database
+* **XP-Pen:** G430, G430S, G640, Star 03, Deco series, and other Rev A/B report variants
+* **Gaomon, Huion, VEIKK:** covered via the built-in database (shared HID report families)
 
----
-
-## Adding More Tablets
-
-If your tablet model is not among the 43 pre-configured profiles, you can add support for it by creating a new `.cfg` file in the `tablets/` folder:
+### Adding Custom Tablets
+If your tablet isn't recognized automatically, create a `.cfg` file in the `tablets/` folder:
 
 ```ini
-name=Your Tablet Name
+name=Tablet Name
 vid=0x056A
 pid=0x037A
 max_x=15200
@@ -239,12 +95,40 @@ report_id=0x02
 x_offset=2
 y_offset=4
 init_feature=0x02 0x02
+init_output=
 ```
+
+`init_output` is optional and only needed for tablets that require an output-report "wake" handshake before they start streaming.
+
+---
+
+## Building from Source
+
+Requires MSVC (Visual Studio 2022 / Build Tools). `builtin_tablets.h` must be in the same folder as `osuPoint.cpp` — it's included directly and holds the built-in tablet database.
+
+Run inside **x64 Native Tools Command Prompt for VS**:
+
+```cmd
+cl.exe /nologo /O2 /Ob3 /Ot /GL /std:c++20 /fp:precise /DNDEBUG /GS- /GR- /EHs-c- /MT /Gw /utf-8 osupoint.cpp osupoint.res /Fe:osuPoint.exe /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
+```
+For AVX2 build
+```cmd
+cl.exe /nologo /O2 /Ob3 /Ot /GL /std:c++20 /arch:AVX2 /fp:precise /DNDEBUG /GS- /GR- /EHs-c- /MT /Gw /utf-8 osupoint.cpp osupoint.res /Fe:osuPoint.exe /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
+```
+---
+
+## Known Limitations
+
+* On tablets that only expose a legacy HID *mouse-mode* interface (no dedicated digitizer report), the Pen Click toggle suppresses clicks via a system-wide low-level mouse hook. This cannot distinguish the tablet's own clicks from a separately connected physical mouse — if you use both at once on such a tablet, disabling Pen Click will silence both.
+
+---
+
+## AI Disclosure
+
+This project is developed with the assistance of AI (LLMs) for code generation, architecture planning, and debugging. The codebase and build artifacts are manually tested, verified with high-speed camera benchmarking, and maintained for stability and minimal latency.
 
 ---
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0 (GPLv3)**.
-
-You are free to run, study, modify, and redistribute this software. However, any derivative work, fork, or distribution must also remain open-source and licensed under GPLv3. See the [LICENSE](LICENSE) file for the full text.
+Licensed under the [GNU General Public License v3.0 (GPLv3)](LICENSE).

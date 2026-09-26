@@ -1123,12 +1123,12 @@ std::vector<std::string> DetectAndInitTablet() {
                             if (HidD_GetPreparsedData(h, &ppData)) {
                                 HIDP_CAPS caps{};
                                 if (HidP_GetCaps(ppData, &caps) == HIDP_STATUS_SUCCESS) {
-                                    isKb = (caps.UsagePage == 0x01 && caps.Usage == 0x06);
+                                    bool isTabletEndpoint = (caps.UsagePage == 0x0D || caps.UsagePage == 0xFF0D || caps.UsagePage >= 0xFF00);
+                                    if (isTabletEndpoint) {
+                                        resultPaths.push_back(detail->DevicePath);
+                                    }
                                 }
                                 HidD_FreePreparsedData(ppData);
-                            }
-                            if (!isKb) {
-                                resultPaths.push_back(detail->DevicePath);
                             }
                         }
                         CloseHandle(h);
@@ -1507,6 +1507,9 @@ inline bool DecodeReport(const BYTE* report, int reportSize, const TabletSpec& s
         raw_x = ReadLE16(&report[3]);
         raw_y = ReadLE16(&report[5]);
         is_pressed = (report[2] & 0x01) != 0;
+        if (reportSize >= 9) {
+            is_pressed = is_pressed && (ReadLE16(&report[7]) > 0);
+        }
     }
     // Huion / Gaomon (Report ID 0x08, or alternate IDs 0x07, 0x09, 0x0A, 0x0E)
     else if (VendorID::IsHuionFamily(spec.vid) && (report[0] == spec.report_id || report[0] == 0x08 || report[0] == 0x07 || report[0] == 0x09 || report[0] == 0x0A || report[0] == 0x0E)) {
@@ -1521,6 +1524,12 @@ inline bool DecodeReport(const BYTE* report, int reportSize, const TabletSpec& s
     }
     // XP-Pen (various revisions)
     else if (VendorID::IsXPPenFamily(spec.vid)) {
+        if (spec.report_id != 0 && report[0] != spec.report_id) {
+            return false;
+        }
+        if (reportSize > 1 && (report[1] & 0x10) != 0) {
+            return false;
+        }
         if (reportSize >= 6) {
             raw_x = ReadLE16(&report[2]);
             raw_y = ReadLE16(&report[4]);
@@ -1546,10 +1555,18 @@ inline bool DecodeReport(const BYTE* report, int reportSize, const TabletSpec& s
         const int min_len = (std::max)(xo + 2, yo + 2);
 
         if (spec.report_id == 0 || report[0] == spec.report_id || report[0] == 0x10) [[likely]] {
+            if (VendorID::IsWacom(spec.vid) && reportSize > 1 && (report[1] & 0x40) == 0) {
+                return false;
+            }
+
             if (reportSize >= min_len) [[likely]] {
                 raw_x = ReadLE16(&report[xo]);
                 raw_y = ReadLE16(&report[yo]);
                 is_pressed = (report[1] & 0x01) != 0;
+                int po = (std::max)(xo, yo) + 2;
+                if (reportSize >= po + 2) {
+                    is_pressed = is_pressed && (ReadLE16(&report[po]) > 0);
+                }
             }
         }
         else {
@@ -1738,6 +1755,9 @@ void ReaderThread() {
                 // 2. Feature report initialization
                 if (!g_spec.init_feature.empty()) {
                     HidD_SetFeature(hDev, g_spec.init_feature.data(), static_cast<ULONG>(g_spec.init_feature.size()));
+                    if (VendorID::IsXPPenFamily(g_spec.vid)) {
+                        HidD_SetOutputReport(hDev, g_spec.init_feature.data(), static_cast<ULONG>(g_spec.init_feature.size()));
+                    }
                 }
                 else if (VendorID::IsWacom(g_spec.vid)) {
                     BYTE defWacomFeature[2] = { 0x02, 0x02 };
@@ -2117,11 +2137,11 @@ void ProcessingThread() {
         const __m128i vi = _mm_cvttpd_epi32(vout);
         const uint64_t packedDxy = static_cast<uint64_t>(_mm_cvtsi128_si64(vi));
 
-        if (inProximityFrames < 3) {
+        if (inProximityFrames < 6) {
             inProximityFrames++;
         }
 
-        bool curPressed = (inProximityFrames >= 3) && report.pressed && g_penClick.load(std::memory_order_relaxed);
+        bool curPressed = (inProximityFrames >= 6) && report.pressed && g_penClick.load(std::memory_order_relaxed);
         bool clickEdge = (curPressed != lastPressed);
 
         // Discard redundant coordinate updates unless a click event must be processed
@@ -2592,47 +2612,6 @@ LRESULT CALLBACK CboSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_INPUT) {
-        // Fallback input path: handle raw input only if dedicated ReaderThread is idle
-        LARGE_INTEGER qpcNow;
-        QueryPerformanceCounter(&qpcNow);
-        uint64_t lastQpc = g_lastReportQpc.load(std::memory_order_relaxed);
-        if (g_numActiveEndpoints.load(std::memory_order_relaxed) > 0) {
-            return DefWindowProc(hwnd, msg, wParam, lParam);
-        }
-
-        UINT dwSize = 0;
-        GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &dwSize, sizeof(RAWINPUTHEADER));
-        if (dwSize > 0 && dwSize <= 512) {
-            alignas(RAWINPUT) BYTE rawBuf[512];
-            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, rawBuf, &dwSize, sizeof(RAWINPUTHEADER)) == dwSize) {
-                auto* raw = reinterpret_cast<RAWINPUT*>(rawBuf);
-                if (raw->header.dwType == RIM_TYPEHID) {
-                    BYTE* data = raw->data.hid.bRawData;
-                    int len = static_cast<int>(raw->data.hid.dwSizeHid);
-                    if (data && len > 0) {
-                        int32_t rx = 0, ry = 0;
-                        bool pressed = false;
-                        if (DecodeReport(data, len, g_spec, rx, ry, pressed)) {
-                            uint64_t nowQpc = static_cast<uint64_t>(qpcNow.QuadPart);
-                            g_lastReportQpc.store(nowQpc, std::memory_order_relaxed);
-                            g_rawReportsReceived.fetch_add(1, std::memory_order_relaxed);
-                            g_reportsReceived.fetch_add(1, std::memory_order_relaxed);
-
-                            TabletReport rep;
-                            rep.raw_x = rx;
-                            rep.raw_y = ry;
-                            rep.hw_timestamp_qpc = nowQpc;
-                            rep.pressed = pressed;
-                            static std::atomic<uint32_t> s_rawInputFrameId{ 0 };
-                            rep.frame_id = s_rawInputFrameId.fetch_add(1, std::memory_order_relaxed) + 1;
-
-                            g_reportStore.Store(rep);
-                            SetEvent(g_reportReadyEvent);
-                        }
-                    }
-                }
-            }
-        }
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     if (msg == WM_DEVICECHANGE) {
@@ -2642,6 +2621,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         }
         return TRUE;
+    }
+    static const UINT s_wmTabletQuery = RegisterWindowMessageA("TabletQuerySystemGestureStatus");
+    if (s_wmTabletQuery && msg == s_wmTabletQuery) {
+        return 0x00000001 | 0x00000008 | 0x00000010 | 0x00000100 | 0x00000200 | 0x00008000 | 0x00010000 | 0x00080000 | 0x00100000;
     }
     if (msg == WM_DISPLAYCHANGE) {
         RefreshMonitors();
@@ -3060,20 +3043,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     devFilter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
     devFilter.dbcc_classguid = hidGuid;
     g_hDevNotify = RegisterDeviceNotificationA(g_hwnd, &devFilter, DEVICE_NOTIFY_WINDOW_HANDLE);
-
-    // Register raw input device notifications for fallback input acquisition
-    RAWINPUTDEVICE rid[2]{};
-    rid[0].usUsagePage = 0x0D; // Digitizer
-    rid[0].usUsage = 0x02; // Pen
-    rid[0].dwFlags = RIDEV_INPUTSINK;
-    rid[0].hwndTarget = g_hwnd;
-
-    rid[1].usUsagePage = 0xFF0D; // Vendor-specific digitizer
-    rid[1].usUsage = 0x02;
-    rid[1].dwFlags = RIDEV_INPUTSINK;
-    rid[1].hwndTarget = g_hwnd;
-
-    RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
 
     BOOL useDarkMode = TRUE;
     if (FAILED(DwmSetWindowAttribute(g_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode)))) {

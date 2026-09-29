@@ -4,6 +4,14 @@ A lightweight, standalone drawing tablet driver written in pure C++20 for Window
 
 It runs entirely in user-mode, uses no background runtimes or virtual kernel drivers, and compiles into a single ~300 KB binary using under 3 MB of RAM.
 
+## Performance & Testing
+
+In side-by-side testing against OpenTabletDriver, newer builds show roughly a 50% reduction in input delay. 
+
+This was measured on a 240 Hz monitor recorded with a smartphone camera in 480 FPS slow-motion, calculating the frame delta between the physical hand/pen movement and the first visible cursor movement on screen.
+
+The lower latency is achieved by bypassing virtual driver queues (VMulti), setting the Windows HID input buffer queue to 4 reports, using high-resolution NTAPI timers (0.5 ms), and removing runtime overhead completely.
+
 ## Hardware Status & Testing
 
 The codebase contains configuration profiles for over 160 tablet models, but only the following devices have been physically tested and verified on real hardware:
@@ -71,7 +79,7 @@ pen_click=1
 
 ## Building
 
-Open the MSVC x64 Native Tools Command Prompt:
+Open the MSVC x64 Native Tools Command Prompt. Compile the resource file first if you modified icons (`rc.exe osuPoint.rc`), then compile:
 
 Standard build:
 ```cmd

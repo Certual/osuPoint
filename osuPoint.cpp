@@ -33,6 +33,8 @@
 #include <cstdint>
 #include <fstream>
 #include <sstream>
+#include <semaphore>
+#include <chrono>
 #include <tlhelp32.h>
 
 #pragma comment(lib, "setupapi.lib")
@@ -221,7 +223,9 @@ public:
     void Store(const TransformConfig& newCfg) noexcept {
         uint32_t s = m_seq.load(std::memory_order_relaxed);
         m_seq.store(s + 1, std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_release);
         m_cfg = newCfg;
+        std::atomic_thread_fence(std::memory_order_release);
         m_seq.store(s + 2, std::memory_order_release);
     }
 
@@ -252,52 +256,36 @@ private:
 TabletSpec g_spec;
 AtomicConfigStore g_cfgStore;
 
-// Single-slot report buffer updated directly by the reader thread
-struct alignas(64) TabletReport {
+// Lock-free single-slot report buffer packed into a 64-bit integer
+struct TabletReport {
     int32_t raw_x = 0;
     int32_t raw_y = 0;
-    uint64_t hw_timestamp_qpc = 0; // Timestamp recorded at packet decode time
-    uint32_t frame_id = 0;         // Monotonic frame counter (0 = uninitialized)
-    bool pressed = false;          // Pen tip contact state
+    uint32_t frame_id = 0;
+    bool pressed = false;
 };
 
-// Lock-free single-slot queue: writer updates seq odd -> even around write operations
-class alignas(64) AtomicReportStore {
+class AtomicReportStore {
 public:
     __forceinline void Store(const TabletReport& r) noexcept {
-        uint32_t s = m_seq.load(std::memory_order_relaxed);
-        m_seq.store(s + 1, std::memory_order_release);
-        m_report = r;
-        m_seq.store(s + 2, std::memory_order_release);
+        uint64_t packed = (static_cast<uint64_t>(r.raw_x) & 0xFFFFF) |
+                          ((static_cast<uint64_t>(r.raw_y) & 0xFFFFF) << 20) |
+                          ((static_cast<uint64_t>(r.pressed) & 1) << 40) |
+                          ((static_cast<uint64_t>(r.frame_id) & 0x7FFFFF) << 41);
+        m_packed.store(packed, std::memory_order_release);
     }
 
-    __forceinline TabletReport Load() noexcept {
-        TabletReport out;
-        uint32_t s1 = 0, s2 = 0;
-        do {
-            s1 = m_seq.load(std::memory_order_acquire);
-            while (s1 & 1) {
-                _mm_pause();
-                s1 = m_seq.load(std::memory_order_acquire);
-            }
-            out = m_report;
-            s2 = m_seq.load(std::memory_order_acquire);
-        } while (s1 != s2);
-        return out;
-    }
-
-    // Fast path: peek frame_id without copying the entire struct
-    [[nodiscard]] __forceinline uint32_t PeekFrameId() const noexcept {
-        uint32_t s = m_seq.load(std::memory_order_acquire);
-        if (s & 1) return 0; // Write currently in progress
-        uint32_t fid = m_report.frame_id;
-        if (m_seq.load(std::memory_order_acquire) != s) return 0;
-        return fid;
+    __forceinline TabletReport Load() const noexcept {
+        uint64_t packed = m_packed.load(std::memory_order_acquire);
+        TabletReport r;
+        r.raw_x = static_cast<int32_t>(packed & 0xFFFFF);
+        r.raw_y = static_cast<int32_t>((packed >> 20) & 0xFFFFF);
+        r.pressed = ((packed >> 40) & 1) != 0;
+        r.frame_id = static_cast<uint32_t>((packed >> 41) & 0x7FFFFF);
+        return r;
     }
 
 private:
-    std::atomic<uint32_t> m_seq{ 0 };
-    TabletReport m_report{};
+    alignas(64) std::atomic<uint64_t> m_packed{ 0 };
 };
 
 AtomicReportStore g_reportStore;
@@ -310,31 +298,26 @@ int g_disp_x = -1;
 int g_disp_y = -1;
 
 FILETIME g_lastConfigTime = { 0 };
-HANDLE g_hDevice = INVALID_HANDLE_VALUE;
+std::atomic<HANDLE> g_hDevice{ INVALID_HANDLE_VALUE };
 HWND g_hwnd = NULL;
 bool g_guiReady = false;
 bool g_isUpdatingUI = false;
 std::string g_baseDir = "";
 
-std::atomic<bool> g_exitDriver{ false };
 HANDLE g_hDeviceChangeEvent = NULL;
-HANDLE g_reportReadyEvent = NULL;
+std::binary_semaphore g_reportSemaphore{0};
 HDEVNOTIFY g_hDevNotify = NULL;
 
-std::thread g_readerThread;
-std::thread g_processingThread;
+std::jthread g_readerThread;
+std::jthread g_processingThread;
 
 LARGE_INTEGER g_qpcFreq{ 0 };
-double g_qpcToUs = 0.0;
 
 std::atomic<uint64_t> g_reportsReceived{ 0 };
 std::atomic<uint64_t> g_rawReportsReceived{ 0 };
-std::atomic<uint64_t> g_reportsActedOn{ 0 };
 std::atomic<uint64_t> g_reportsDeduped{ 0 };
 std::atomic<uint32_t> g_reconnectCount{ 0 };
-std::atomic<uint32_t> g_errorCount{ 0 };
 std::atomic<DWORD>    g_lastReadError{ 0 };
-std::atomic<int>      g_lastReportLen{ 0 };
 std::atomic<uint32_t> g_lastReportBytes{ 0 };
 std::atomic<uint64_t> g_lastReportQpc{ 0 };
 std::atomic<int>      g_numActiveEndpoints{ 0 };
@@ -1167,6 +1150,11 @@ std::vector<std::string> DetectAndInitTablet() {
         else if (VendorID::IsXPPenFamily(vid)) {
             spec.report_id = 0x02; spec.max_x = 32000; spec.max_y = 20000;
             spec.phys_w = 160.0; spec.phys_h = 100.0; spec.x_offset = 2; spec.y_offset = 4;
+            if (reportLen <= 9) {
+                ParseHexBytes("0x02 0xB0 0x02", spec.init_output);
+            } else {
+                ParseHexBytes("0x02 0xB0 0x04", spec.init_output);
+            }
         }
         else if (VendorID::IsVeikk(vid)) {
             spec.report_id = 0x02; spec.max_x = 32767; spec.max_y = 32767;
@@ -1357,7 +1345,7 @@ void UpdateStatusText() noexcept {
         snprintf(title, sizeof(title), "osu!Point - [CLOSE %s IN TASK MANAGER!]", s_conflict.c_str());
         snprintf(tip, sizeof(tip), "Close %s in Task Manager to allow osu!Point access!", s_conflict.c_str());
     }
-    else if (g_hDevice != INVALID_HANDLE_VALUE) {
+    else if (g_hDevice.load(std::memory_order_acquire) != INVALID_HANDLE_VALUE) {
         uint64_t reports = g_reportsReceived.load(std::memory_order_relaxed);
         uint64_t raw = g_rawReportsReceived.load(std::memory_order_relaxed);
         int eps = g_numActiveEndpoints.load(std::memory_order_relaxed);
@@ -1467,18 +1455,16 @@ void CheckConfigFileReload() {
     }
 }
 
-inline uint16_t ReadLE16(const BYTE* ptr) noexcept {
+__forceinline uint16_t ReadLE16(const BYTE* ptr) noexcept {
     uint16_t val;
     std::memcpy(&val, ptr, sizeof(uint16_t));
     return val;
 }
 
-inline bool DecodeReport(const BYTE* report, int reportSize, const TabletSpec& spec, int32_t& out_x, int32_t& out_y, bool& out_pressed) noexcept {
+__forceinline bool DecodeReport(const BYTE* report, int reportSize, const TabletSpec& spec,
+    int32_t& out_x, int32_t& out_y, bool& out_pressed,
+    bool& io_prevPressed, int32_t& io_prevX, int32_t& io_prevY) noexcept {
     if (!report || reportSize < 4) return false;
-
-    // Track previous report state to handle abrupt proximity exit (0xC0 sentinel)
-    static thread_local bool s_prevPressed = false;
-    static thread_local int32_t s_prevX = 0, s_prevY = 0;
 
     // XP-Pen / VEIKK: byte 0xC0 signifies the pen has left proximity
     if (VendorID::IsXPPenFamily(spec.vid) || VendorID::IsVeikk(spec.vid)) {
@@ -1487,11 +1473,10 @@ inline bool DecodeReport(const BYTE* report, int reportSize, const TabletSpec& s
         if (reportSize > 2 && report[1] == 0x41 && report[2] == 0xC0) isLift = true;
 
         if (isLift) {
-            // Emit a single release event if tip was active to prevent stuck clicks
-            if (s_prevPressed) {
-                s_prevPressed = false;
-                out_x = s_prevX;
-                out_y = s_prevY;
+            if (io_prevPressed) {
+                io_prevPressed = false;
+                out_x = io_prevX;
+                out_y = io_prevY;
                 out_pressed = false;
                 return true;
             }
@@ -1598,14 +1583,14 @@ inline bool DecodeReport(const BYTE* report, int reportSize, const TabletSpec& s
     out_y = raw_y;
     out_pressed = is_pressed;
 
-    s_prevPressed = is_pressed;
-    s_prevX = raw_x;
-    s_prevY = raw_y;
+    io_prevPressed = is_pressed;
+    io_prevX = raw_x;
+    io_prevY = raw_y;
     return true;
 }
 
 // Dedicated HID input reading thread
-void ReaderThread() {
+void ReaderThread(std::stop_token stoken) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     if (g_affinityPair.reader != 0) {
@@ -1653,15 +1638,17 @@ void ReaderThread() {
         }
         numSlots = 0;
         consecutiveErrors = 0;
-        g_hDevice = INVALID_HANDLE_VALUE;
+        g_hDevice.store(INVALID_HANDLE_VALUE, std::memory_order_release);
         g_numActiveEndpoints.store(0, std::memory_order_relaxed);
         };
+
+    bool dr_prevPressed = false;
+    int32_t dr_prevX = 0, dr_prevY = 0;
 
     auto dispatchReport = [&](const BYTE* data, int len) noexcept {
         if (!data || len <= 0) return;
 
         g_rawReportsReceived.fetch_add(1, std::memory_order_relaxed);
-        g_lastReportLen.store(len, std::memory_order_relaxed);
         if (len >= 4) {
             uint32_t b4 = static_cast<uint32_t>(data[0]) |
                 (static_cast<uint32_t>(data[1]) << 8) |
@@ -1672,7 +1659,7 @@ void ReaderThread() {
 
         int32_t rx = 0, ry = 0;
         bool pressed = false;
-        if (DecodeReport(data, len, g_spec, rx, ry, pressed)) {
+        if (DecodeReport(data, len, g_spec, rx, ry, pressed, dr_prevPressed, dr_prevX, dr_prevY)) {
             LARGE_INTEGER qpc;
             QueryPerformanceCounter(&qpc);
             uint64_t nowQpc = static_cast<uint64_t>(qpc.QuadPart);
@@ -1682,17 +1669,18 @@ void ReaderThread() {
             TabletReport rep;
             rep.raw_x = rx;
             rep.raw_y = ry;
-            rep.hw_timestamp_qpc = nowQpc;
             rep.frame_id = ++localFrameId;
             rep.pressed = pressed;
 
             g_reportStore.Store(rep);
-            SetEvent(g_reportReadyEvent);
+            g_reportSemaphore.release();
             consecutiveErrors = 0;
         }
         };
 
-    while (!g_exitDriver.load(std::memory_order_relaxed)) {
+    uint64_t lastWakeAttemptQpc = 0;
+
+    while (!stoken.stop_requested()) {
         if (numSlots == 0) {
             std::vector<std::string> devPaths = DetectAndInitTablet();
             if (devPaths.empty()) {
@@ -1738,7 +1726,7 @@ void ReaderThread() {
                 continue;
             }
 
-            g_hDevice = slots[0].hDevice;
+            g_hDevice.store(slots[0].hDevice, std::memory_order_release);
             g_numActiveEndpoints.store(numSlots, std::memory_order_relaxed);
 
             auto sendTabletWakeHandshake = [&](HANDLE hDev, int outLen) noexcept {
@@ -1812,16 +1800,15 @@ void ReaderThread() {
             if (g_spec.is_mouse_mode && !g_hMouseHook) {
                 g_hMouseHook = SetWindowsHookExA(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandleA(NULL), 0);
             }
-            UpdateStatusText();
+            if (g_hwnd) PostMessage(g_hwnd, WM_USER + 10, 0, 0);
         }
 
         // Keep-alive retry if no reports are received after opening
-        static uint64_t s_lastWakeAttemptQpc = 0;
         if (g_rawReportsReceived.load(std::memory_order_relaxed) == 0 && numSlots > 0) {
             LARGE_INTEGER qpcNow;
             QueryPerformanceCounter(&qpcNow);
-            if (s_lastWakeAttemptQpc == 0 || (qpcNow.QuadPart - s_lastWakeAttemptQpc) > (g_qpcFreq.QuadPart * 2)) {
-                s_lastWakeAttemptQpc = qpcNow.QuadPart;
+            if (lastWakeAttemptQpc == 0 || (qpcNow.QuadPart - lastWakeAttemptQpc) > (g_qpcFreq.QuadPart * 2)) {
+                lastWakeAttemptQpc = qpcNow.QuadPart;
                 for (int i = 0; i < numSlots; ++i) {
                     wchar_t strDesc[256];
                     HidD_GetIndexedString(slots[i].hDevice, 2, strDesc, sizeof(strDesc));
@@ -1969,7 +1956,7 @@ void ReaderThread() {
 
         if (anyCompleted) continue;
 
-        DWORD waitRes = WaitForMultipleObjects(waitCount + 1, waitHandles, FALSE, 250);
+        DWORD waitRes = WaitForMultipleObjects(waitCount + 1, waitHandles, FALSE, 2);
         if (waitRes >= WAIT_OBJECT_0 && waitRes < (WAIT_OBJECT_0 + waitCount)) {
             int slotIdx = slotMap[waitRes - WAIT_OBJECT_0];
             DWORD transferred = 0;
@@ -1993,7 +1980,7 @@ void ReaderThread() {
 }
 
 // Processing thread: transforms tablet coordinates and injects mouse input
-void ProcessingThread() {
+void ProcessingThread(std::stop_token stoken) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     if (g_affinityPair.processor != 0) {
@@ -2036,43 +2023,43 @@ void ProcessingThread() {
 
     int idleSpins = 0;
     bool wasOutside = false;
+    bool localPenClick = g_penClick.load(std::memory_order_relaxed);
+    const uint64_t watchdogThreshold = static_cast<uint64_t>(g_qpcFreq.QuadPart) * 15 / 1000;
 
-    while (!g_exitDriver.load(std::memory_order_relaxed)) {
-
-        uint32_t peekFid = g_reportStore.PeekFrameId();
-
-        if (peekFid == lastProcessedFrameId || peekFid == 0) {
-            ++idleSpins;
-            if (idleSpins <= 128) {
-                // Short spin wait for incoming packets (< 1.5 µs)
-                _mm_pause();
-            }
-            else {
-                // Sleep until next report event or timeout
-                WaitForSingleObject(g_reportReadyEvent, 1);
-                idleSpins = 0;
-            }
-
-            // Watchdog: release mouse button if pen lifts abruptly without sending a release packet
-            LARGE_INTEGER qpcNow;
-            QueryPerformanceCounter(&qpcNow);
-            uint64_t lastQpc = g_lastReportQpc.load(std::memory_order_relaxed);
-            if (lastQpc != 0 && (static_cast<uint64_t>(qpcNow.QuadPart) - lastQpc) > (static_cast<uint64_t>(g_qpcFreq.QuadPart) * 35 / 1000)) {
-                if (lastPressed) {
-                    INPUT upInput = { 0 };
-                    upInput.type = INPUT_MOUSE;
-                    upInput.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-                    SendInput(1, &upInput, sizeof(INPUT));
-                    lastPressed = false;
-                }
-                inProximityFrames = 0;
-            }
-            continue;
-        }
+    while (!stoken.stop_requested()) {
 
         TabletReport report = g_reportStore.Load();
-        if (report.frame_id == lastProcessedFrameId) {
-            _mm_pause();
+
+        if (report.frame_id == lastProcessedFrameId || report.frame_id == 0) {
+            if (report.frame_id == 0 && lastProcessedFrameId != 0) {
+                lastProcessedFrameId = 0;
+                inProximityFrames = 0;
+            }
+            ++idleSpins;
+            if (idleSpins <= 128) {
+                _mm_pause();
+                continue;
+            }
+
+            // Watchdog check only after leaving the spin window (every ~128 pauses or after sleep)
+            {
+                LARGE_INTEGER qpcNow;
+                QueryPerformanceCounter(&qpcNow);
+                uint64_t lastQpc = g_lastReportQpc.load(std::memory_order_relaxed);
+                if (lastQpc != 0 && (static_cast<uint64_t>(qpcNow.QuadPart) - lastQpc) > watchdogThreshold) {
+                    if (lastPressed) {
+                        INPUT upInput = { 0 };
+                        upInput.type = INPUT_MOUSE;
+                        upInput.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                        SendInput(1, &upInput, sizeof(INPUT));
+                        lastPressed = false;
+                    }
+                    inProximityFrames = 0;
+                }
+            }
+
+            (void)g_reportSemaphore.try_acquire_for(std::chrono::milliseconds(1));
+            idleSpins = 0;
             continue;
         }
 
@@ -2090,6 +2077,7 @@ void ProcessingThread() {
             vvscale = _mm_load_pd(localCfg.vscale);
             vvshift = _mm_load_pd(localCfg.vshift);
             wasOutside = false;
+            localPenClick = g_penClick.load(std::memory_order_relaxed);
         }
 
         // SIMD evaluation of normalized coordinates [un, vn]
@@ -2137,11 +2125,11 @@ void ProcessingThread() {
         const __m128i vi = _mm_cvttpd_epi32(vout);
         const uint64_t packedDxy = static_cast<uint64_t>(_mm_cvtsi128_si64(vi));
 
-        if (inProximityFrames < 6) {
+        if (inProximityFrames < 3) {
             inProximityFrames++;
         }
 
-        bool curPressed = (inProximityFrames >= 6) && report.pressed && g_penClick.load(std::memory_order_relaxed);
+        bool curPressed = (inProximityFrames >= 3) && report.pressed && localPenClick;
         bool clickEdge = (curPressed != lastPressed);
 
         // Discard redundant coordinate updates unless a click event must be processed
@@ -2484,19 +2472,21 @@ void ShutdownDriver() {
 
     if (g_hwnd) KillTimer(g_hwnd, 1);
 
-    g_exitDriver.store(true, std::memory_order_release);
+    g_readerThread.request_stop();
+    g_processingThread.request_stop();
 
-    if (g_hDevice != INVALID_HANDLE_VALUE) {
-        CancelIoEx(g_hDevice, nullptr);
+    {
+        HANDLE hDev = g_hDevice.load(std::memory_order_acquire);
+        if (hDev != INVALID_HANDLE_VALUE) {
+            CancelIoEx(hDev, nullptr);
+        }
     }
 
     if (g_hDeviceChangeEvent) {
         SetEvent(g_hDeviceChangeEvent);
     }
 
-    if (g_reportReadyEvent) {
-        SetEvent(g_reportReadyEvent);
-    }
+    g_reportSemaphore.release();
 
     if (g_hDevNotify) {
         UnregisterDeviceNotification(g_hDevNotify);
@@ -2508,11 +2498,6 @@ void ShutdownDriver() {
     }
     if (g_processingThread.joinable()) {
         g_processingThread.join();
-    }
-
-    if (g_reportReadyEvent) {
-        CloseHandle(g_reportReadyEvent);
-        g_reportReadyEvent = NULL;
     }
 
     DisableSubMillisecondTimer();
@@ -2639,6 +2624,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             s_timerTicks = 0;
             UpdateStatusText();
         }
+        return 0;
+    }
+    if (msg == WM_USER + 10) {
+        UpdateStatusText();
         return 0;
     }
     if (msg == WM_ACTIVATE && LOWORD(wParam) != WA_INACTIVE) {
@@ -2974,9 +2963,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
     QueryPerformanceFrequency(&g_qpcFreq);
 
-    if (g_qpcFreq.QuadPart > 0) {
-        g_qpcToUs = 1e6 / static_cast<double>(g_qpcFreq.QuadPart);
-    }
 
     g_affinityPair = CalculateDualAffinity();
 
@@ -2986,7 +2972,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     g_hDeviceChangeEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    g_reportReadyEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
 
     g_baseDir = GetExeDirectory();
     RefreshMonitors();
@@ -3129,8 +3114,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
     ShowWindow(g_hwnd, nCmdShow);
 
-    g_readerThread = std::thread(ReaderThread);
-    g_processingThread = std::thread(ProcessingThread);
+    g_readerThread = std::jthread(ReaderThread);
+    g_processingThread = std::jthread(ProcessingThread);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {

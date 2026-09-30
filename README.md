@@ -2,7 +2,7 @@
 
 A lightweight, standalone drawing tablet driver written in pure C++20 for Windows, designed specifically for osu!.
 
-It runs entirely in user-mode, uses no background runtimes or virtual kernel drivers, and compiles into a single ~300 KB binary using under 3 MB of RAM.
+It runs entirely in user-mode, uses no background runtimes or virtual kernel drivers, and compiles into a single ~300 KB binary using under 1.9 MB of RAM.
 
 ## Performance & Testing
 

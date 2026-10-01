@@ -25,7 +25,6 @@ The codebase contains configuration profiles for over 160 tablet models. The fol
 - Wacom Bamboo (CTL-471)
 - Wacom Intuos S / M (CTL-4100 / CTL-6100, including WL/Bluetooth variants)
 - XP-Pen Star G430S
-- XP-Pen Star 03 V2
 
 ### Beta Testers Wanted
 If you own any other tablet (Wacom, XP-Pen, Huion, Gaomon, Veikk), please test the driver and report whether your device works properly (detection, pen tracking, clicks, proximity). You can submit reports by opening an issue on GitHub. Unknown XP-Pen devices will automatically attempt to use a generic fallback profile with a magic wake-up packet.

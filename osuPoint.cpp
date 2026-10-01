@@ -322,6 +322,49 @@ std::atomic<uint32_t> g_lastReportBytes{ 0 };
 std::atomic<uint64_t> g_lastReportQpc{ 0 };
 std::atomic<int>      g_numActiveEndpoints{ 0 };
 
+struct WacomDiagnosticStats {
+    std::atomic<uint64_t> accepted{0};
+    std::atomic<uint64_t> rejected{0};
+    std::atomic<uint64_t> glitches{0};
+    std::atomic<uint64_t> exceptions{0}; // For 0x10 exceptions
+};
+extern WacomDiagnosticStats g_wacomStats;
+WacomDiagnosticStats g_wacomStats;
+
+struct RejectedReport {
+    uint8_t endpoint;
+    uint8_t len;
+    uint8_t data[16];
+};
+
+class RejectedRingBuffer {
+    static constexpr int N = 64;
+    RejectedReport ring[N];
+    std::atomic<uint64_t> index{0};
+public:
+    void Add(uint8_t endpoint, int len, const BYTE* data) {
+        uint64_t idx = index.fetch_add(1, std::memory_order_relaxed) % N;
+        ring[idx].endpoint = endpoint;
+        ring[idx].len = static_cast<uint8_t>(len > 255 ? 255 : len);
+        int copyLen = len < 16 ? len : 16;
+        if (data) std::memcpy(ring[idx].data, data, copyLen);
+        if (copyLen < 16) std::memset(ring[idx].data + copyLen, 0, 16 - copyLen);
+    }
+};
+extern RejectedRingBuffer g_rejectedRing;
+RejectedRingBuffer g_rejectedRing;
+
+struct PrevPacketData {
+    uint64_t qpc{0};
+    int32_t x = 0;
+    int32_t y = 0;
+    int len = 0;
+    BYTE data[16]{};
+};
+extern PrevPacketData g_prevPacket;
+PrevPacketData g_prevPacket;
+
+
 inline void LogMessage([[maybe_unused]] const std::string& msg) noexcept {}
 
 HFONT g_hFont = NULL;
@@ -1350,7 +1393,11 @@ void UpdateStatusText() noexcept {
         uint64_t raw = g_rawReportsReceived.load(std::memory_order_relaxed);
         int eps = g_numActiveEndpoints.load(std::memory_order_relaxed);
         DWORD lastErr = g_lastReadError.load(std::memory_order_relaxed);
-        snprintf(title, sizeof(title), "osu!Point - [%s]", g_spec.name.c_str());
+        uint64_t w_ok = g_wacomStats.accepted.load(std::memory_order_relaxed);
+        uint64_t w_rej = g_wacomStats.rejected.load(std::memory_order_relaxed);
+        uint64_t w_gl = g_wacomStats.glitches.load(std::memory_order_relaxed);
+        uint64_t w_exc = g_wacomStats.exceptions.load(std::memory_order_relaxed);
+        snprintf(title, sizeof(title), "osu!Point - [%s] (OK:%llu Rej:%llu G:%llu E:%llu)", g_spec.name.c_str(), w_ok, w_rej, w_gl, w_exc);
 
         uint32_t b4 = g_lastReportBytes.load(std::memory_order_relaxed);
         BYTE b0 = b4 & 0xFF, b1 = (b4 >> 8) & 0xFF, b2 = (b4 >> 16) & 0xFF, b3 = (b4 >> 24) & 0xFF;
@@ -1463,7 +1510,7 @@ __forceinline uint16_t ReadLE16(const BYTE* ptr) noexcept {
 
 __forceinline bool DecodeReport(const BYTE* report, int reportSize, const TabletSpec& spec,
     int32_t& out_x, int32_t& out_y, bool& out_pressed,
-    bool& io_prevPressed, int32_t& io_prevX, int32_t& io_prevY) noexcept {
+    bool& io_prevPressed, int32_t& io_prevX, int32_t& io_prevY, int endpointIdx) noexcept {
     if (!report || reportSize < 4) return false;
 
     // XP-Pen / VEIKK: byte 0xC0 signifies the pen has left proximity
@@ -1539,12 +1586,18 @@ __forceinline bool DecodeReport(const BYTE* report, int reportSize, const Tablet
         const int yo = spec.y_offset;
         const int min_len = (std::max)(xo + 2, yo + 2);
 
-        if (spec.report_id == 0 || report[0] == spec.report_id || report[0] == 0x10) [[likely]] {
-            if (VendorID::IsWacom(spec.vid) && reportSize > 1 && (report[1] & 0x40) == 0) {
-                return false;
+        if (VendorID::IsWacom(spec.vid)) {
+            bool valid = false;
+            if (reportSize > 0) {
+                if (report[0] == spec.report_id) {
+                    valid = true;
+                } else if (spec.report_id == 0x02 && report[0] == 0x10) {
+                    valid = true;
+                    g_wacomStats.exceptions.fetch_add(1, std::memory_order_relaxed);
+                }
             }
 
-            if (reportSize >= min_len) [[likely]] {
+            if (valid && reportSize >= min_len && (report[1] & 0x40) != 0) {
                 raw_x = ReadLE16(&report[xo]);
                 raw_y = ReadLE16(&report[yo]);
                 is_pressed = (report[1] & 0x01) != 0;
@@ -1552,13 +1605,30 @@ __forceinline bool DecodeReport(const BYTE* report, int reportSize, const Tablet
                 if (reportSize >= po + 2) {
                     is_pressed = is_pressed && (ReadLE16(&report[po]) > 0);
                 }
+                g_wacomStats.accepted.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_wacomStats.rejected.fetch_add(1, std::memory_order_relaxed);
+                g_rejectedRing.Add(endpointIdx, reportSize, report);
+                return false;
             }
-        }
-        else {
-            if (xo >= 1 && yo >= 1 && reportSize >= (std::max)(xo + 1, yo + 1)) {
-                raw_x = ReadLE16(&report[xo - 1]);
-                raw_y = ReadLE16(&report[yo - 1]);
-                is_pressed = (report[0] & 0x01) != 0;
+        } else {
+            if (spec.report_id == 0 || report[0] == spec.report_id || report[0] == 0x10) [[likely]] {
+                if (reportSize >= min_len) [[likely]] {
+                    raw_x = ReadLE16(&report[xo]);
+                    raw_y = ReadLE16(&report[yo]);
+                    is_pressed = (report[1] & 0x01) != 0;
+                    int po = (std::max)(xo, yo) + 2;
+                    if (reportSize >= po + 2) {
+                        is_pressed = is_pressed && (ReadLE16(&report[po]) > 0);
+                    }
+                }
+            }
+            else {
+                if (xo >= 1 && yo >= 1 && reportSize >= (std::max)(xo + 1, yo + 1)) {
+                    raw_x = ReadLE16(&report[xo - 1]);
+                    raw_y = ReadLE16(&report[yo - 1]);
+                    is_pressed = (report[0] & 0x01) != 0;
+                }
             }
         }
     }
@@ -1645,8 +1715,21 @@ void ReaderThread(std::stop_token stoken) {
     bool dr_prevPressed = false;
     int32_t dr_prevX = 0, dr_prevY = 0;
 
-    auto dispatchReport = [&](const BYTE* data, int len) noexcept {
+    auto dispatchReport = [&](const BYTE* data, int len, int endpointIdx) noexcept {
         if (!data || len <= 0) return;
+
+        static int packetCount = 0;
+        if (packetCount < 250) {
+            FILE* f = fopen("tablet_raw_data.txt", "a");
+            if (f) {
+                for (int k = 0; k < len; k++) {
+                    fprintf(f, "%02X ", data[k]);
+                }
+                fprintf(f, "\n");
+                fclose(f);
+            }
+            packetCount++;
+        }
 
         g_rawReportsReceived.fetch_add(1, std::memory_order_relaxed);
         if (len >= 4) {
@@ -1659,10 +1742,28 @@ void ReaderThread(std::stop_token stoken) {
 
         int32_t rx = 0, ry = 0;
         bool pressed = false;
-        if (DecodeReport(data, len, g_spec, rx, ry, pressed, dr_prevPressed, dr_prevX, dr_prevY)) {
+        if (DecodeReport(data, len, g_spec, rx, ry, pressed, dr_prevPressed, dr_prevX, dr_prevY, endpointIdx)) {
             LARGE_INTEGER qpc;
             QueryPerformanceCounter(&qpc);
             uint64_t nowQpc = static_cast<uint64_t>(qpc.QuadPart);
+            
+            if (g_spec.max_x > 0 && g_spec.max_y > 0 && g_prevPacket.qpc > 0) {
+                if ((nowQpc - g_prevPacket.qpc) * 1000 / g_qpcFreq.QuadPart < 20) {
+                    double dx = (double)(rx - g_prevPacket.x) / g_spec.max_x;
+                    double dy = (double)(ry - g_prevPacket.y) / g_spec.max_y;
+                    if (dx*dx + dy*dy > 0.0625) { // 0.25 * 0.25 = 0.0625
+                        g_wacomStats.glitches.fetch_add(1, std::memory_order_relaxed);
+                        g_rejectedRing.Add(endpointIdx, g_prevPacket.len, g_prevPacket.data);
+                        g_rejectedRing.Add(endpointIdx, len, data);
+                    }
+                }
+            }
+            g_prevPacket.qpc = nowQpc;
+            g_prevPacket.x = rx;
+            g_prevPacket.y = ry;
+            g_prevPacket.len = len;
+            int cpLen = len < 16 ? len : 16;
+            if (data) std::memcpy(g_prevPacket.data, data, cpLen);
             g_lastReportQpc.store(nowQpc, std::memory_order_relaxed);
             g_reportsReceived.fetch_add(1, std::memory_order_relaxed);
 
@@ -1733,12 +1834,12 @@ void ReaderThread(std::stop_token stoken) {
                 if (!hDev || hDev == INVALID_HANDLE_VALUE) return;
 
                 // 1. Query vendor string descriptors to trigger tablet MCU initialization
-                wchar_t strDesc[256];
-                HidD_GetIndexedString(hDev, 2, strDesc, sizeof(strDesc));
-                HidD_GetIndexedString(hDev, 100, strDesc, sizeof(strDesc));
-                HidD_GetIndexedString(hDev, 110, strDesc, sizeof(strDesc));
-                HidD_GetIndexedString(hDev, 200, strDesc, sizeof(strDesc));
-                HidD_GetIndexedString(hDev, 201, strDesc, sizeof(strDesc));
+                // Legacy UCLogic string probes commented out because they brick modern XP-Pen tablets into PID 1227 mode
+                // HidD_GetIndexedString(hDev, 2, strDesc, sizeof(strDesc));
+                // HidD_GetIndexedString(hDev, 100, strDesc, sizeof(strDesc));
+                // HidD_GetIndexedString(hDev, 110, strDesc, sizeof(strDesc));
+                // HidD_GetIndexedString(hDev, 200, strDesc, sizeof(strDesc));
+                // HidD_GetIndexedString(hDev, 201, strDesc, sizeof(strDesc));
 
                 // 2. Feature report initialization
                 if (!g_spec.init_feature.empty()) {
@@ -1810,9 +1911,9 @@ void ReaderThread(std::stop_token stoken) {
             if (lastWakeAttemptQpc == 0 || (qpcNow.QuadPart - lastWakeAttemptQpc) > (g_qpcFreq.QuadPart * 2)) {
                 lastWakeAttemptQpc = qpcNow.QuadPart;
                 for (int i = 0; i < numSlots; ++i) {
-                    wchar_t strDesc[256];
-                    HidD_GetIndexedString(slots[i].hDevice, 2, strDesc, sizeof(strDesc));
-                    HidD_GetIndexedString(slots[i].hDevice, 100, strDesc, sizeof(strDesc));
+                    // wchar_t strDesc[256];
+                    // HidD_GetIndexedString(slots[i].hDevice, 2, strDesc, sizeof(strDesc));
+                    // HidD_GetIndexedString(slots[i].hDevice, 100, strDesc, sizeof(strDesc));
 
                     if (!g_spec.init_output.empty()) {
                         int sendLen = (slots[i].outputReportLen > 0) ? slots[i].outputReportLen : static_cast<int>(g_spec.init_output.size());
@@ -1856,7 +1957,7 @@ void ReaderThread(std::stop_token stoken) {
                     while (readOk) {
                         DWORD transferred = 0;
                         if (GetOverlappedResult(slots[i].hDevice, &slots[i].ov, &transferred, FALSE)) {
-                            dispatchReport(slots[i].buf, static_cast<int>(transferred));
+                            dispatchReport(slots[i].buf, static_cast<int>(transferred), i);
                         }
                         slots[i].ov.Internal = 0;
                         slots[i].ov.InternalHigh = 0;
@@ -1945,7 +2046,7 @@ void ReaderThread(std::stop_token stoken) {
                     anyCompleted = true;
                     DWORD transferred = 0;
                     if (GetOverlappedResult(slots[sIdx].hDevice, &slots[sIdx].ov, &transferred, FALSE)) {
-                        dispatchReport(slots[sIdx].buf, static_cast<int>(transferred));
+                        dispatchReport(slots[sIdx].buf, static_cast<int>(transferred), sIdx);
                         consecutiveErrors = 0;
                     }
                     slots[sIdx].isPending = false;
@@ -1961,7 +2062,7 @@ void ReaderThread(std::stop_token stoken) {
             int slotIdx = slotMap[waitRes - WAIT_OBJECT_0];
             DWORD transferred = 0;
             if (GetOverlappedResult(slots[slotIdx].hDevice, &slots[slotIdx].ov, &transferred, FALSE)) {
-                dispatchReport(slots[slotIdx].buf, static_cast<int>(transferred));
+                dispatchReport(slots[slotIdx].buf, static_cast<int>(transferred), slotIdx);
                 consecutiveErrors = 0;
             }
             slots[slotIdx].isPending = false;

@@ -1,8 +1,20 @@
-# osu!Point
+<div align="center">
+  <img src="logo.svg" alt="osu!Point Logo" width="128" />
 
-A lightweight, standalone drawing tablet driver written in pure C++20 for Windows, designed specifically for osu!.
+  # osu!Point
+  
+  A modern, ultra-low latency tablet driver for osu!, digital art, and everyday pen input. Built in C++20 for Windows with direct hardware input injection, minimal CPU overhead, and precise mapping controls.
 
-It runs entirely in user-mode, uses no background runtimes or virtual kernel drivers, and compiles into a single ~300 KB binary using under 1.9 MB of RAM.
+  [![release](https://img.shields.io/github/v/release/Certual/osuPoint?style=flat-square)](https://github.com/Certual/osuPoint/releases/latest)
+  [![build](https://img.shields.io/github/actions/workflow/status/Certual/osuPoint/build.yml?style=flat-square&label=build)](https://github.com/Certual/osuPoint/actions)
+  [![platform](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&logo=windows&logoColor=white)](https://github.com/Certual/osuPoint)
+  [![license](https://img.shields.io/github/license/Certual/osuPoint?style=flat-square)](https://github.com/Certual/osuPoint/blob/main/LICENSE)
+  [![c++](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square&logo=c%2B%2B)](https://github.com/Certual/osuPoint)
+</div>
+
+## About
+
+**osu!Point** is designed to bypass the traditional Windows input pipeline, directly parsing HID reports and injecting absolute mouse coordinates to achieve the absolute minimum input latency possible.
 
 ## Performance & Testing
 

@@ -3,7 +3,7 @@
 
   # osu!Point
   
-  A modern, ultra-low latency tablet driver for osu!, digital art, and everyday pen input. Built in C++20 for Windows with direct hardware input injection, minimal CPU overhead, and precise mapping controls.
+  A modern, ultra-low latency tablet driver for osu!, digital art, and everyday pen input.
 
   [![release](https://img.shields.io/github/v/release/Certual/osuPoint?style=flat-square)](https://github.com/Certual/osuPoint/releases/latest)
   [![build](https://img.shields.io/github/actions/workflow/status/Certual/osuPoint/build.yml?style=flat-square&label=build)](https://github.com/Certual/osuPoint/actions)
@@ -96,16 +96,26 @@ pen_click=1
 
 ## Building
 
-Open the MSVC **x64 Native Tools Command Prompt**. Compile the resource file first if you modified icons (`rc.exe osuPoint.rc`), then compile:
-
-Standard extreme-low-latency build:
+### Quick Build Script
+Run `build.bat` to interactively select a target or pass an argument:
 ```cmd
-cl.exe /nologo /O2 /Ob3 /Ot /GL /Gy /Zc:inline /std:c++20 /fp:precise /DNDEBUG /GS- /GR- /EHs-c- /MT /Gw /utf-8 osupoint.cpp osuPoint.res /Fe:osuPoint.exe /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
+build.bat 1   # AVX2 Release (osuPoint.exe)
+build.bat 2   # SSE2 Compatibility (osuPoint-noavx.exe)
+build.bat 3   # Developer + Selftest (osuPoint-dev.exe)
+build.bat 4   # All targets
 ```
 
-AVX2 build:
+### Manual Compilation
+Open the MSVC **x64 Native Tools Command Prompt** and run:
+
+AVX2 Release build:
 ```cmd
-cl.exe /nologo /O2 /Ob3 /Ot /GL /Gy /Zc:inline /std:c++20 /arch:AVX2 /fp:precise /DNDEBUG /GS- /GR- /EHs-c- /MT /Gw /utf-8 osupoint.cpp osuPoint.res /Fe:osuPoint.exe /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
+cl.exe /nologo /O2 /Ot /Oi /Ob3 /GL /Gy /Gw /Oy /cgthreads1 /Brepro /Zc:inline /Zc:threadSafeInit- /Zc:tlsGuards- /Zc:nrvo /jumptablerdata /presetPadding- /favor:blend /guard:cf- /volatile:iso /std:c++20 /fp:fast /fp:except- /Gv /GA /Qfast_transcendentals /Qspectre- /sdl- /DNDEBUG /D_HAS_EXCEPTIONS=0 /D_DISABLE_VECTOR_ANNOTATION /D_ITERATOR_DEBUG_LEVEL=0 /GS- /GR- /EHs- /EHc- /EHa- /MT /utf-8 /W4 /WX /I . /I src /arch:AVX2 /Fe:osuPoint.exe src\platform.cpp src\tablet_decoder.cpp src\driver_pipeline.cpp src\config_manager.cpp src\ui_view.cpp src\osuPoint.cpp src\osuPoint.res /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF /MERGE:.rdata=.text /GUARD:NO /CETCOMPAT:NO /DYNAMICBASE:NO /HIGHENTROPYVA:NO /INCREMENTAL:NO /FILEALIGN:4096 /STACK:0x100000,0x100000 /HEAP:0x100000,0x100000 gdiplus.lib comdlg32.lib /DEBUG:NONE /RELEASE
+```
+
+SSE2 Compatibility build:
+```cmd
+cl.exe /nologo /O2 /Ot /Oi /Ob3 /GL /Gy /Gw /Oy /cgthreads1 /Brepro /Zc:inline /Zc:threadSafeInit- /Zc:tlsGuards- /Zc:nrvo /jumptablerdata /presetPadding- /favor:blend /guard:cf- /volatile:iso /std:c++20 /fp:fast /fp:except- /Gv /GA /Qfast_transcendentals /Qspectre- /sdl- /DNDEBUG /D_HAS_EXCEPTIONS=0 /D_DISABLE_VECTOR_ANNOTATION /D_ITERATOR_DEBUG_LEVEL=0 /GS- /GR- /EHs- /EHc- /EHa- /MT /utf-8 /W4 /WX /I . /I src /Fe:osuPoint-noavx.exe src\platform.cpp src\tablet_decoder.cpp src\driver_pipeline.cpp src\config_manager.cpp src\ui_view.cpp src\osuPoint.cpp src\osuPoint.res /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF /MERGE:.rdata=.text /GUARD:NO /CETCOMPAT:NO /DYNAMICBASE:NO /HIGHENTROPYVA:NO /INCREMENTAL:NO /FILEALIGN:4096 /STACK:0x100000,0x100000 /HEAP:0x100000,0x100000 gdiplus.lib comdlg32.lib /DEBUG:NONE /RELEASE
 ```
 
 ## Transparency Note

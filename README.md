@@ -14,57 +14,71 @@
 
 ## About
 
-**osu!Point** is designed to bypass the traditional Windows input pipeline, directly parsing HID reports and injecting absolute mouse coordinates to achieve the absolute minimum input latency possible.
+**osu!Point** is designed to bypass the traditional Windows input pipeline, directly parsing raw HID reports and injecting absolute coordinates to achieve the lowest possible input latency.
 
-## Performance & Testing
+## Performance & Architecture
 
-In side-by-side testing against OpenTabletDriver, newer builds show roughly a 50% reduction in input delay. 
+In side-by-side testing against OpenTabletDriver, builds show roughly a 50% reduction in end-to-end input delay.
 
-This was measured on a 240 Hz monitor recorded with a smartphone camera in 480 FPS slow-motion, calculating the frame delta between the physical hand/pen movement and the first visible cursor movement on screen.
+This was measured on a 240 Hz monitor recorded with a smartphone camera in 480 FPS slow-motion, calculating the frame delta between physical pen movement and the first visible cursor movement on screen.
 
-The lower latency is achieved by:
-- Bypassing virtual driver queues (VMulti) and injecting directly via absolute desktop coordinates.
-- Using C++20 `std::binary_semaphore` (which utilizes the undocumented Windows `WaitOnAddress` syscall for the user-space fast-path) to drop thread-wake overhead to **~20ns**.
-- Using a 100% lock-free packed 64-bit atomic integer to pass coordinate packets between threads without context-switching the USB polling thread.
-- Setting the Windows HID input buffer queue to 4 reports.
-- Using high-resolution NTAPI timers (0.5 ms) and MMCSS Pro Audio thread scheduling.
+Low latency is achieved through:
+- Direct syscall dispatch via `NtUserSendInput` (`win32u.dll`) with `MOUSEEVENTF_MOVE_NOCOALESCE`, bypassing user-mode `user32.dll` wrappers, Windows Ink, and virtual driver queues (`VMulti`).
+- Pipelined double-buffered `OVERLAPPED` USB transfers (`FILE_SKIP_SET_EVENT_ON_HANDLE`) that rearm `ReadFile` on the host controller immediately before user-space packet processing begins.
+- A 64-byte cache-line-aligned lock-free SPSC ring buffer (`SpscRing<RawPacket, 64>`) and seqlock configuration store (`AtomicConfigStore`) with zero heap allocations on the hot path.
+- SIMD-accelerated (`AVX2` + `FMA` / `SSE2`) coordinate transformation and boundary clipping.
+- Configurable **Latency Spin** (`Eco 0%` to `100%`), allowing users to choose between event-driven `< 0.2%` CPU usage or continuous L1 cache polling.
+- Optional **Adaptive Kinematic Extrapolation** (`1.0`–`5.0 ms` lookahead `tau`) with turnaround and braking overshoot suppression.
+- Sub-millisecond system timer resolution (`0.5 ms` via `NtSetTimerResolution`), disabled thread power throttling, MMCSS `"Pro Audio"` scheduling, and automatic P-core thread affinity pinning on hybrid CPUs.
 
-## Hardware Status & Testing
+## Hardware Support
 
-The codebase contains configuration profiles for over 160 tablet models. The following devices have been physically tested or verified by the community to work perfectly:
+The driver includes built-in specifications for over 160 tablet models across Wacom, XP-Pen, Huion, Gaomon, VEIKK, UC-Logic, Artisul, and Ugee:
+- Automatic 16-bit, 17-bit, 18-bit, and 24-bit coordinate decoding.
+- Automatic Huion / Gaomon / XP-Pen binary String Descriptor `200` interrogation to read exact hardware `max_x`, `max_y`, and `LPI` on shared-PID controllers.
+- Multi-endpoint monitoring (up to 4 concurrent interfaces) with automatic vendor wake-up handshakes (`SetFeature`, `SetOutputReport`, `WriteFile`) and conflict detection.
 
-- Wacom One (CTL-472)
-- Wacom Bamboo (CTL-471)
-- Wacom Intuos S / M (CTL-4100 / CTL-6100, including WL/Bluetooth variants)
-- XP-Pen Star G430S
+Devices physically verified by the author and community:
+- Wacom One (`CTL-472`)
+- Wacom Bamboo (`CTL-471`)
+- Wacom Intuos S / M (`CTL-4100` / `CTL-6100`, including WL/Bluetooth variants)
+- XP-Pen Star `G430S`
 
-### Beta Testers Wanted
-If you own any other tablet (Wacom, XP-Pen, Huion, Gaomon, Veikk), please test the driver and report whether your device works properly (detection, pen tracking, clicks, proximity). You can submit reports by opening an issue on GitHub. Unknown XP-Pen devices will automatically attempt to use a generic fallback profile with a magic wake-up packet.
+If you test another tablet model (Wacom, XP-Pen, Huion, Gaomon, VEIKK), open an issue on GitHub with your results or `--probe` output.
 
 ## Features
 
-- Native C++20 with zero dynamic memory allocations in the hot input loop.
-- Direct Win32 HID communication without virtual drivers (VMulti).
-- Standalone ~300 KB executable with under 3 MB of RAM usage.
-- Built-in GUI: visual area preview, drag-to-resize/move, 16:9 ratio lock, rotation, and display selection.
-- Two-thread pipeline (USB Polling / Coordinate Processing) decoupled via C++20 lock-free atomics and `std::jthread`.
-- Automatic P-core CPU affinity pinning on hybrid processors.
+- Standalone ~600 KB executable with static CRT linkage (`/MT`) and under 3 MB of RAM usage.
+- **Area Tab:** Interactive area preview canvas with drag-to-move/resize, aspect ratio lock (`Screen` / `Area` auto-match with configurable decimal precision), rotation, area clipping (`Clip Area`), area lock (`Lock Area`), pen tip click toggle, and area presets.
+- **Settings Tab:** Dynamic Windows 11 Mica/Dark/Light theme integration, 9 built-in color palettes, custom color picker and theme presets, custom background image with adjustable box blur (`0–20 px`) and card opacity (`10–100%`), Kinematic Extrapolation controls, Latency Spin control, and live VT100 debug telemetry console.
+- **System Tray Integration:** Minimizes cleanly to the system tray with quick toggles for Pen Click and window restoration.
 
 ## Setup
 
-1. Close existing tablet software (OpenTabletDriver, Wacom Center, Pentablet) so osu!Point can claim the USB handle.
-2. In osu! settings:
-   - Turn OFF "Raw Input".
-   - Keep "Sensitivity" at 1.0x.
-   (osu!Point injects absolute desktop coordinates via SendInput, so Raw Input is unnecessary).
-3. Launch `osuPoint.exe`. The driver will attempt to auto-detect your tablet. Adjust your active area and test.
+1. Close conflicting tablet drivers (OpenTabletDriver, Wacom Center, Pentablet) or hide the native device via HidHide so **osu!Point** can open the USB interface in exclusive mode.
+2. In **osu!** settings:
+   - Turn **OFF** `Raw Input`.
+   - Keep `Sensitivity` at `1.0x`.
+3. Launch `osuPoint.exe` (or `osuPoint-noavx.exe` on older CPUs without AVX2 support).
 
-## Adding Custom Tablets
+## Command-Line Options
 
-If your tablet is not in the built-in database, you can place a `.cfg` file in a `tablets/` subfolder next to the executable:
+```cmd
+osuPoint.exe --help                  # Show available command-line options
+osuPoint.exe --debug                 # Enable live VT100 telemetry console and verbose logs
+osuPoint.exe --list-devices          # List detected tablet HID interfaces and match scores
+osuPoint.exe --probe                 # Dump HID descriptor capabilities and 50 raw packets to probe_dump.txt
+osuPoint.exe --calibrate             # Print live raw/normalized/screen coordinate min-max traces
+osuPoint.exe --dump-reports <file>   # Append raw incoming HID reports to a binary file
+osuPoint-dev.exe --selftest          # Run V1-V21 golden decode vectors, transform, and extrapolation tests
+```
 
-```ini
-name=My Tablet
+# Adding Custom Tablets
+
+To override a built-in profile or add an unlisted model, place a `.cfg` file inside the `tablets/` folder next to `osuPoint.exe`:
+
+```ini, TOML
+name=My Custom Tablet
 vid=0x28BD
 pid=0x0914
 max_x=32000
@@ -75,53 +89,71 @@ report_len=14
 report_id=0x02
 x_offset=2
 y_offset=4
+coord_bits=16
+tip_pressure_threshold=0
+init_output=0x02 0xB0 0x04
 ```
 
-## Configuration
+Supported initialization directives in `.cfg` files: `init_feature`, `init_output`, and `init_write`.
 
-Settings are saved in `config.ini` in the executable folder and reload automatically on save:
+## Configuration (`config.ini`)
 
-```ini
-width=80.0
-height=55.0
-center_x=76.0
+Settings are stored in `config.ini` next to the executable and hot-reloaded automatically when modified:
+
+```ini, TOML
+width=80
+height=45
+center_x=76
 center_y=47.5
-rotation=0.0
+rotation=0
 monitor=0
 lock_ratio=1
 ratio=16:9
+ratio_precision=2
+lock_drag=0
 clip_area=0
 pen_click=1
+barrel_button=1
+antialiasing=1
+extrapolation=0
+extrapolation_tau=2.5
+spin_percent=0
+debug_mode=0
+palette=system
+ui_opacity=80
+bg_blur=0
+active_preset=Default
 ```
 
-## Building
+# Building
 
-### Quick Build Script
-Run `build.bat` to interactively select a target or pass an argument:
-```cmd
-build.bat 1   # AVX2 Release (osuPoint.exe)
-build.bat 2   # SSE2 Compatibility (osuPoint-noavx.exe)
-build.bat 3   # Developer + Selftest (osuPoint-dev.exe)
-build.bat 4   # All targets
+## Build Script
+
+Run `build.bat` from the repository root:
+
+```DOS
+build.bat 1  # AVX2 Release (osuPoint.exe)
+build.bat 2  # SSE2 Compatibility (osuPoint-noavx.exe)
+build.bat 3  # Developer + Selftest (osuPoint-dev.exe)
+build.bat 4  # Build all targets
 ```
 
-### Manual Compilation
-Open the MSVC **x64 Native Tools Command Prompt** and run:
+## Manual Compilation
 
-AVX2 Release build:
-```cmd
-cl.exe /nologo /O2 /Ot /Oi /Ob3 /GL /Gy /Gw /Oy /cgthreads1 /Brepro /Zc:inline /Zc:threadSafeInit- /Zc:tlsGuards- /Zc:nrvo /jumptablerdata /presetPadding- /favor:blend /guard:cf- /volatile:iso /std:c++20 /fp:fast /fp:except- /Gv /GA /Qfast_transcendentals /Qspectre- /sdl- /DNDEBUG /D_HAS_EXCEPTIONS=0 /D_DISABLE_VECTOR_ANNOTATION /D_ITERATOR_DEBUG_LEVEL=0 /GS- /GR- /EHs- /EHc- /EHa- /MT /utf-8 /W4 /WX /I . /I src /arch:AVX2 /Fe:osuPoint.exe src\platform.cpp src\tablet_decoder.cpp src\driver_pipeline.cpp src\config_manager.cpp src\ui_view.cpp src\osuPoint.cpp src\osuPoint.res /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF /MERGE:.rdata=.text /GUARD:NO /CETCOMPAT:NO /DYNAMICBASE:NO /HIGHENTROPYVA:NO /INCREMENTAL:NO /FILEALIGN:4096 /STACK:0x100000,0x100000 /HEAP:0x100000,0x100000 gdiplus.lib comdlg32.lib /DEBUG:NONE /RELEASE
+From an x64 Native Tools Command Prompt for VS:
+
+**AVX2 Release (`osuPoint.exe`):**
+
+```DOS
+cl.exe /nologo /O2 /Ot /Oi /Ob3 /GL /Gy /Gw /Oy /cgthreads1 /Brepro /Zc:inline /Zc:threadSafeInit- /Zc:tlsGuards- /Zc:nrvo /jumptablerdata /presetPadding- /favor:blend /guard:cf- /volatile:iso /std:c++20 /arch:AVX2 /fp:fast /fp:except- /Gv /GA /Qfast_transcendentals /Qspectre- /sdl- /DNDEBUG /D_HAS_EXCEPTIONS=0 /D_DISABLE_VECTOR_ANNOTATION /D_ITERATOR_DEBUG_LEVEL=0 /GS- /GR- /EHs- /EHc- /EHa- /MT /utf-8 /W4 /WX /I . /Fe:osuPoint.exe osuPoint.cpp src\cli.cpp src\log.cpp src\selftest.cpp osuPoint.res /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF /MERGE:.rdata=.text /GUARD:NO /CETCOMPAT:NO /DYNAMICBASE:NO /HIGHENTROPYVA:NO /INCREMENTAL:NO /FILEALIGN:4096 /STACK:0x100000,0x100000 /HEAP:0x100000,0x100000 /DEBUG:NONE /RELEASE
 ```
 
-SSE2 Compatibility build:
-```cmd
-cl.exe /nologo /O2 /Ot /Oi /Ob3 /GL /Gy /Gw /Oy /cgthreads1 /Brepro /Zc:inline /Zc:threadSafeInit- /Zc:tlsGuards- /Zc:nrvo /jumptablerdata /presetPadding- /favor:blend /guard:cf- /volatile:iso /std:c++20 /fp:fast /fp:except- /Gv /GA /Qfast_transcendentals /Qspectre- /sdl- /DNDEBUG /D_HAS_EXCEPTIONS=0 /D_DISABLE_VECTOR_ANNOTATION /D_ITERATOR_DEBUG_LEVEL=0 /GS- /GR- /EHs- /EHc- /EHa- /MT /utf-8 /W4 /WX /I . /I src /Fe:osuPoint-noavx.exe src\platform.cpp src\tablet_decoder.cpp src\driver_pipeline.cpp src\config_manager.cpp src\ui_view.cpp src\osuPoint.cpp src\osuPoint.res /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF /MERGE:.rdata=.text /GUARD:NO /CETCOMPAT:NO /DYNAMICBASE:NO /HIGHENTROPYVA:NO /INCREMENTAL:NO /FILEALIGN:4096 /STACK:0x100000,0x100000 /HEAP:0x100000,0x100000 gdiplus.lib comdlg32.lib /DEBUG:NONE /RELEASE
+**SSE2 Baseline (`osuPoint-noavx.exe`):**
+
+```DOS
+cl.exe /nologo /O2 /Ot /Oi /Ob3 /GL /Gy /Gw /Oy /cgthreads1 /Brepro /Zc:inline /Zc:threadSafeInit- /Zc:tlsGuards- /Zc:nrvo /jumptablerdata /presetPadding- /favor:blend /guard:cf- /volatile:iso /std:c++20 /arch:AVX /fp:fast /fp:except- /Gv /GA /Qfast_transcendentals /Qspectre- /sdl- /DNDEBUG /D_HAS_EXCEPTIONS=0 /D_DISABLE_VECTOR_ANNOTATION /D_ITERATOR_DEBUG_LEVEL=0 /GS- /GR- /EHs- /EHc- /EHa- /MT /utf-8 /W4 /WX /I . /Fe:osuPoint.exe osuPoint.cpp src\cli.cpp src\log.cpp src\selftest.cpp osuPoint.res /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF /MERGE:.rdata=.text /GUARD:NO /CETCOMPAT:NO /DYNAMICBASE:NO /HIGHENTROPYVA:NO /INCREMENTAL:NO /FILEALIGN:4096 /STACK:0x100000,0x100000 /HEAP:0x100000,0x100000 /DEBUG:NONE /RELEASE
 ```
 
-## Transparency Note
-
-This project was developed with assistance from AI (LLMs) by a beginner developer. All code, API implementations, and packet parsers have been manually debugged, reviewed, and validated on available hardware.
-
-## License
+# License
 
 GPL-3.0

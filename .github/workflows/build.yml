@@ -1,100 +1,71 @@
-name: Build and Release
+name: Build & Release
 
 on:
   push:
-    branches: [ main, Debug, Experimental ]
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
+      - master
   workflow_dispatch:
-    inputs:
-      tag_name:
-        description: 'Release tag (e.g. v0.5.0)'
-        required: true
-        default: 'v0.5.0'
-      release_title:
-        description: 'Release title (optional, defaults to tag)'
-        required: false
-        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
-  build-and-release:
+  build:
+    name: Build & Verify
     runs-on: windows-latest
 
-    env:
-      CFLAGS_COMMON: >-
-        /nologo /O2 /Ot /Oi /Ob3 /GL /Gy /Gw /Oy /cgthreads1 /Brepro
-        /Zc:inline /Zc:threadSafeInit- /Zc:tlsGuards- /Zc:nrvo
-        /jumptablerdata /presetPadding- /favor:blend /guard:cf-
-        /volatile:iso /std:c++20 /fp:fast /fp:except- /Gv /GA
-        /Qfast_transcendentals /Qspectre- /sdl- /DNDEBUG
-        /D_HAS_EXCEPTIONS=0 /D_DISABLE_VECTOR_ANNOTATION
-        /D_ITERATOR_DEBUG_LEVEL=0 /GS- /GR- /EHs- /EHc- /EHa- /MT
-        /utf-8 /W4 /WX /I . /I src
-      LFLAGS: >-
-        /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
-        /MERGE:.rdata=.text /GUARD:NO /CETCOMPAT:NO /DYNAMICBASE:NO
-        /HIGHENTROPYVA:NO /INCREMENTAL:NO /FILEALIGN:4096
-        /STACK:0x100000,0x100000 /HEAP:0x100000,0x100000
-        gdiplus.lib comdlg32.lib /DEBUG:NONE /RELEASE
-      SRCS_COMMON: >-
-        src\platform.cpp src\tablet_decoder.cpp src\driver_pipeline.cpp
-        src\config_manager.cpp src\ui_view.cpp src\osuPoint.cpp
-        src\osuPoint.res
-
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Setup MSVC environment
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-    - name: Build Developer binary and run Selftest
-      shell: cmd
-      run: |
-        cl.exe %CFLAGS_COMMON% /DENABLE_SELFTEST=1 /Fe:osuPoint-dev.exe %SRCS_COMMON% src\selftest.cpp %LFLAGS%
-        .\osuPoint-dev.exe --selftest
+      - name: Build All Targets
+        shell: cmd
+        run: call build.bat ALL
 
-    - name: Build SSE2 Baseline (Standard)
-      shell: cmd
-      run: |
-        cl.exe %CFLAGS_COMMON% /Fe:osuPoint.exe %SRCS_COMMON% %LFLAGS%
-        mkdir dist-standard
-        move osuPoint.exe dist-standard\
+      - name: Run Hardware Golden Vectors Selftest
+        shell: pwsh
+        run: .\osuPoint-dev.exe --selftest
 
-    - name: Build AVX2 Release
-      shell: cmd
-      run: |
-        cl.exe %CFLAGS_COMMON% /arch:AVX2 /Fe:osuPoint.exe %SRCS_COMMON% %LFLAGS%
-        mkdir dist-avx2
-        move osuPoint.exe dist-avx2\
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: osuPoint-binaries
+          path: |
+            osuPoint.exe
+            osuPoint-avx.exe
+            osuPoint-sse.exe
+            osuPoint-dev.exe
+          if-no-files-found: error
 
-    - name: Package ZIP archives
-      shell: pwsh
-      run: |
-        Compress-Archive -Path dist-standard\* -DestinationPath "osuPoint.zip" -Force
-        Compress-Archive -Path dist-avx2\* -DestinationPath "osuPoint-avx2.zip" -Force
-
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: osuPoint-binaries
-        path: |
-          osuPoint.zip
-          osuPoint-avx2.zip
-
-    - name: Publish GitHub Release
-      if: github.event_name == 'workflow_dispatch'
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ inputs.tag_name }}
-        name: ${{ inputs.release_title != '' && inputs.release_title || inputs.tag_name }}
-        draft: false
-        prerelease: false
-        files: |
-          osuPoint.zip
-          osuPoint-avx2.zip
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            osuPoint.exe
+            osuPoint-avx.exe
+            osuPoint-sse.exe
+            osuPoint-dev.exe
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

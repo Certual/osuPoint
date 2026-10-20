@@ -12,10 +12,27 @@ on:
       - main
       - master
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v0.6.0). Leave empty to only build and test.'
+        required: false
+        default: ''
+      release_title:
+        description: 'Release title (optional, defaults to tag)'
+        required: false
+        default: ''
+      draft:
+        description: 'Create draft release'
+        type: boolean
+        default: false
+      prerelease:
+        description: 'Mark as prerelease'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: write
@@ -44,11 +61,28 @@ jobs:
         shell: pwsh
         run: .\osuPoint-dev.exe --selftest
 
+      - name: Package Release Archives
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist/sse, dist/avx, dist/avx2 -Force | Out-Null
+
+          Copy-Item osuPoint-sse.exe dist/sse/osuPoint.exe
+          Compress-Archive -Path dist/sse/* -DestinationPath osuPoint-sse.zip -Force
+
+          Copy-Item osuPoint-avx.exe dist/avx/osuPoint.exe
+          Compress-Archive -Path dist/avx/* -DestinationPath osuPoint-avx.zip -Force
+
+          Copy-Item osuPoint.exe dist/avx2/osuPoint.exe
+          Compress-Archive -Path dist/avx2/* -DestinationPath osuPoint-avx2.zip -Force
+
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: osuPoint-binaries
           path: |
+            osuPoint-sse.zip
+            osuPoint-avx.zip
+            osuPoint-avx2.zip
             osuPoint.exe
             osuPoint-avx.exe
             osuPoint-sse.exe
@@ -56,16 +90,17 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ (github.event_name == 'workflow_dispatch' && inputs.tag_name != '') && inputs.tag_name || github.ref_name }}
+          name: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_title != '') && inputs.release_title || github.ref_name }}
           files: |
-            osuPoint.exe
-            osuPoint-avx.exe
-            osuPoint-sse.exe
-            osuPoint-dev.exe
-          draft: false
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+            osuPoint-sse.zip
+            osuPoint-avx.zip
+            osuPoint-avx2.zip
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || (contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc')) }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

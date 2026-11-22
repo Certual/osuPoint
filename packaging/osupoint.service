@@ -1,0 +1,15 @@
+[Unit]
+Description=osuPoint Ultra-Low Latency Linux Tablet Driver Daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/osupointd
+Restart=always
+RestartSec=1
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+Nice=-20
+
+[Install]
+WantedBy=default.target

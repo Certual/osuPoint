@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=osuPoint
+Comment=Ultra-Low Latency Linux Tablet Driver & Configuration GUI
+Exec=/usr/local/bin/osupoint
+Icon=osupoint
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;Game;
+StartupNotify=true
+StartupWMClass=osupoint

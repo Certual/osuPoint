@@ -1,0 +1,14 @@
+# udev rules for osuPoint Linux tablet driver
+# Grants access to /dev/uinput and tablet /dev/hidraw devices to active user session
+
+# /dev/uinput access
+KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"
+
+# Graphics Tablets hidraw access (Wacom, Huion, XP-Pen, Gaomon, Veikk, Parblo, etc.)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="056a", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="256c", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="28bd", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2e2c", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="5543", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b57", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", MODE="0660", GROUP="input", TAG+="uaccess"

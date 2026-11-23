@@ -23,7 +23,7 @@ extern HWND chkUnlockLimits;
 extern HWND lblStyle, hCboStyle;
 extern HWND lblBlurType, hCboBlurType;
 extern HWND chkExtrapolate;
-extern HWND lblExtraTau, btnExtraDec, btnExtraVal, btnExtraInc;
+extern HWND lblExtraLead, btnExtraDec, btnExtraVal, btnExtraInc;
 extern HWND lblAntiNoise, btnAntiNoiseVal;
 extern HWND lblMotionFilter, btnMotionFilterVal;
 extern HWND lblPalette, hCboPalette, btnPickPalette, btnSavePalette, btnDelPalette;

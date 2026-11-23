@@ -988,7 +988,7 @@ void InputDispatchThread(std::stop_token stoken) {
     RuntimeTabletSpec localSpec = g_specStore.Load();
     uint32_t localSpecSeq = g_specStore.GetSequence();
     PrevPacketData prevPacket{};
-    KinematicExtrapolator extrapolator;
+    AdaptiveFilterPipeline extrapolator;
 
     uint64_t localLastReportQpc = 0;
     uint64_t localMeasuredIntervalQpc = 0;

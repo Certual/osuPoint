@@ -1,0 +1,84 @@
+name: Build & Release (Linux)
+
+on:
+  push:
+    branches:
+      - Linux
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - Linux
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v0.6.1-linux or v0.7.0). Leave empty to only build and test.'
+        required: false
+        default: ''
+      release_title:
+        description: 'Release title (optional, defaults to tag)'
+        required: false
+        default: ''
+      draft:
+        description: 'Create draft release'
+        type: boolean
+        default: false
+      prerelease:
+        description: 'Mark as prerelease'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Verify Linux Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential g++ make zip tar \
+            libglfw3-dev libgl1-mesa-dev libx11-dev libsystemd-dev
+
+      - name: Build All Architectures & Verify Test Suites
+        run: |
+          make package-all
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: osuPoint-linux-binaries
+          path: dist/releases/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ (github.event_name == 'workflow_dispatch' && inputs.tag_name != '') && inputs.tag_name || github.ref_name }}
+          name: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_title != '') && inputs.release_title || github.ref_name }}
+          files: |
+            dist/releases/osuPoint-linux-sse.tar.gz
+            dist/releases/osuPoint-linux-sse.zip
+            dist/releases/osuPoint-linux-avx.tar.gz
+            dist/releases/osuPoint-linux-avx.zip
+            dist/releases/osuPoint-linux-avx2.tar.gz
+            dist/releases/osuPoint-linux-avx2.zip
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || (contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc')) }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

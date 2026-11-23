@@ -566,9 +566,9 @@ void LoadConfig() {
                 if (t >= 0.5 && t <= 10.0) g_extrapolationTau = t;
             }
             else if (key == "filter" || key == "filter_percent" || key == "one_euro_filter" || key == "smoothing") {
-                int f = std::atoi(valStr.c_str());
-                if (f == 1 && valStr == "1") f = 25;
-                g_filterPercent = f;
+                int filtVal = std::atoi(valStr.c_str());
+                if (filtVal == 1 && valStr == "1") filtVal = 25;
+                g_filterPercent = filtVal;
             }
             else if (key == "motion_filter" || key == "motion_smooth" || key == "motion_filter_percent") {
                 g_motionFilterPercent = std::atoi(valStr.c_str());
@@ -849,5 +849,4 @@ void DeleteCustomPalette(const std::string& name) {
         SaveConfig();
     }
 }
-
 

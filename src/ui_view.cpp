@@ -33,7 +33,7 @@ HWND chkUnlockLimits = NULL;
 HWND lblStyle = NULL, hCboStyle = NULL;
 HWND lblBlurType = NULL, hCboBlurType = NULL;
 HWND chkExtrapolate = NULL;
-HWND lblExtraTau = NULL, btnExtraDec = NULL, btnExtraVal = NULL, btnExtraInc = NULL;
+HWND lblExtraLead = NULL, btnExtraDec = NULL, btnExtraVal = NULL, btnExtraInc = NULL;
 HWND lblAntiNoise = NULL, btnAntiNoiseVal = NULL;
 HWND lblMotionFilter = NULL, btnMotionFilterVal = NULL;
 HWND lblPalette = NULL, hCboPalette = NULL, btnPickPalette = NULL, btnSavePalette = NULL, btnDelPalette = NULL;
@@ -47,6 +47,7 @@ HWND btnReset = NULL, btnHelp = NULL;
 HWND g_hHelpWnd = NULL;
 static WNDPROC s_origEditProc = NULL;
 static WNDPROC g_origDragValProc = NULL;
+TransformConfig g_transformConfig{};
 
 double g_uiScale = 1.0;
 
@@ -1462,7 +1463,7 @@ static const char* s_manualEntries[] = {
     nullptr
 };
 
-static LRESULT CALLBACK HelpWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+LRESULT CALLBACK HelpWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -1496,7 +1497,7 @@ static LRESULT CALLBACK HelpWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 continue;
             }
             if (line[0] == '-' && line[1] == '-' && line[2] == '-') {
-                SetTextColor(memDC, COLOR_ACCENT);
+                SetTextColor(memDC, g_colorAccent);
                 HFONT oldHdr = (HFONT)SelectObject(memDC, g_hFont);
                 TextOutA(memDC, x, y, line, static_cast<int>(strlen(line)));
                 SelectObject(memDC, oldHdr);
@@ -1572,7 +1573,7 @@ void ShowHelpManual(HWND hParent) {
 static bool s_isDraggingVal = false;
 static POINT s_dragValStartPt = { 0, 0 };
 
-static LRESULT CALLBACK DragValSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+LRESULT CALLBACK DragValSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     int ctrlId = GetDlgCtrlID(hwnd);
     switch (msg) {
     case WM_LBUTTONDOWN: {
@@ -1671,70 +1672,68 @@ static LRESULT CALLBACK DragValSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, 
         if (title[0]) {
             std::string res = ShowPromptDialog(hParent, title, label, buf);
             if (!res.empty()) {
-                try {
-                    switch (ctrlId) {
-                    case 1020: {
-                        int v = std::stoi(res);
-                        g_uiOpacity = (std::max)(10, (std::min)(100, v));
-                        UpdateOpacityDisplay();
-                        TriggerBackingRedraw(g_hwnd);
-                        SaveConfig();
-                        break;
-                    }
-                    case 1023: {
-                        int v = std::stoi(res);
-                        g_bgBlur = (std::max)(0, (std::min)(100, v));
-                        UpdateBlurDisplay();
-                        ApplyBgBlur();
-                        TriggerBackingRedraw(g_hwnd);
-                        SaveConfig();
-                        break;
-                    }
-                    case 1027: {
-                        double v = std::stod(res);
-                        double maxV = g_transformConfig.unlock_limits ? 50.0 : 15.0;
-                        g_extrapolationMm = (std::max)(0.0, (std::min)(maxV, v));
-                        g_transformConfig.extrapolation_mm = g_extrapolationMm;
-                        UpdateExtrapolateDisplay();
-                        SaveConfig();
-                        break;
-                    }
-                    case 1030: {
-                        int v = std::stoi(res);
-                        g_ratioPrecision = (std::max)(0, (std::min)(6, v));
-                        UpdateRatioPrecisionDisplay();
-                        UpdateValues();
-                        SaveConfig();
-                        break;
-                    }
-                    case 1035: {
-                        int v = std::stoi(res);
-                        int maxV = g_transformConfig.unlock_limits ? 1000 : 100;
-                        g_spinPercent = (std::max)(0, (std::min)(maxV, v));
-                        UpdateSpinDisplay();
-                        SaveConfig();
-                        break;
-                    }
-                    case 1055: {
-                        int v = std::stoi(res);
-                        int maxV = g_transformConfig.unlock_limits ? 500 : 100;
-                        g_filterPercent = (std::max)(0, (std::min)(maxV, v));
-                        g_transformConfig.filter_percent = g_filterPercent;
-                        UpdateAntiNoiseDisplay();
-                        SaveConfig();
-                        break;
-                    }
-                    case 1070: {
-                        int v = std::stoi(res);
-                        int maxV = g_transformConfig.unlock_limits ? 500 : 100;
-                        g_motionFilterPercent = (std::max)(0, (std::min)(maxV, v));
-                        g_transformConfig.motion_filter_percent = g_motionFilterPercent;
-                        UpdateMotionFilterDisplay();
-                        SaveConfig();
-                        break;
-                    }
-                    }
-                } catch (...) {}
+                switch (ctrlId) {
+                case 1020: {
+                    int v = std::atoi(res.c_str());
+                    g_uiOpacity = (std::max)(10, (std::min)(100, v));
+                    UpdateOpacityDisplay();
+                    TriggerBackingRedraw(g_hwnd);
+                    SaveConfig();
+                    break;
+                }
+                case 1023: {
+                    int v = std::atoi(res.c_str());
+                    g_bgBlur = (std::max)(0, (std::min)(100, v));
+                    UpdateBlurDisplay();
+                    ApplyBgBlur();
+                    TriggerBackingRedraw(g_hwnd);
+                    SaveConfig();
+                    break;
+                }
+                case 1027: {
+                    double v = std::atof(res.c_str());
+                    double maxV = g_transformConfig.unlock_limits ? 50.0 : 15.0;
+                    g_extrapolationMm = (std::max)(0.0, (std::min)(maxV, v));
+                    g_transformConfig.extrapolation_mm = g_extrapolationMm;
+                    UpdateExtrapolateDisplay();
+                    SaveConfig();
+                    break;
+                }
+                case 1030: {
+                    int v = std::atoi(res.c_str());
+                    g_ratioPrecision = (std::max)(0, (std::min)(6, v));
+                    UpdateRatioPrecisionDisplay();
+                    UpdateValues();
+                    SaveConfig();
+                    break;
+                }
+                case 1035: {
+                    int v = std::atoi(res.c_str());
+                    int maxV = g_transformConfig.unlock_limits ? 1000 : 100;
+                    g_spinPercent = (std::max)(0, (std::min)(maxV, v));
+                    UpdateSpinDisplay();
+                    SaveConfig();
+                    break;
+                }
+                case 1055: {
+                    int v = std::atoi(res.c_str());
+                    int maxV = g_transformConfig.unlock_limits ? 500 : 100;
+                    g_filterPercent = (std::max)(0, (std::min)(maxV, v));
+                    g_transformConfig.filter_percent = g_filterPercent;
+                    UpdateAntiNoiseDisplay();
+                    SaveConfig();
+                    break;
+                }
+                case 1070: {
+                    int v = std::atoi(res.c_str());
+                    int maxV = g_transformConfig.unlock_limits ? 500 : 100;
+                    g_motionFilterPercent = (std::max)(0, (std::min)(maxV, v));
+                    g_transformConfig.motion_filter_percent = g_motionFilterPercent;
+                    UpdateMotionFilterDisplay();
+                    SaveConfig();
+                    break;
+                }
+                }
             }
         }
         return 0;
@@ -1822,7 +1821,7 @@ void SwitchTab(int tabIndex) {
         g_activeTab = (tabIndex == 1) ? 1 : 0;
     }
     if (g_activeTab != 1) {
-        g_settingsSubTab = SettingsSubTab::Tune;
+        g_settingsSubTab = SUBTAB_TUNE;
     }
 
     HWND mainControls[] = {
@@ -1885,11 +1884,11 @@ void SwitchTab(int tabIndex) {
         for (HWND c : miscControls) { if (c) ShowWindow(c, SW_SHOW); }
     } else {
         for (HWND c : subTabButtons) { if (c) ShowWindow(c, SW_SHOW); }
-        if (g_settingsSubTab == SettingsSubTab::Tune) {
+        if (g_settingsSubTab == SUBTAB_TUNE) {
             for (HWND c : tuneControls) { if (c) ShowWindow(c, SW_SHOW); }
-        } else if (g_settingsSubTab == SettingsSubTab::Look) {
+        } else if (g_settingsSubTab == SUBTAB_LOOK) {
             for (HWND c : lookControls) { if (c) ShowWindow(c, SW_SHOW); }
-        } else if (g_settingsSubTab == SettingsSubTab::Theme) {
+        } else if (g_settingsSubTab == SUBTAB_THEME) {
             for (HWND c : themeControls) { if (c) ShowWindow(c, SW_SHOW); }
         }
     }

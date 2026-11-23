@@ -537,6 +537,8 @@ struct ExtrapolationConfig {
     double tau_ms = 2.5;
 };
 
+extern double g_qpcToUs;
+
 class KinematicExtrapolator {
 public:
     void Reset() noexcept {

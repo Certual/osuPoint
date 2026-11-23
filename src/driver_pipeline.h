@@ -395,6 +395,7 @@ class AdaptiveFilterPipeline {
 public:
     void Reset() noexcept {
         m_initialized = false;
+        m_activeLead = false;
         m_prevX = 0.0;
         m_prevY = 0.0;
         m_prevRawX = 0.0;
@@ -486,10 +487,16 @@ public:
             double lead_factor = extrapolation_mm / speed;
             outX = x_filt + m_filteredDx * lead_factor;
             outY = y_filt + m_filteredDy * lead_factor;
+            m_activeLead = true;
         } else {
             outX = x_filt;
             outY = y_filt;
+            m_activeLead = false;
         }
+    }
+
+    [[nodiscard]] bool HasActiveLead() const noexcept {
+        return m_activeLead;
     }
 
     void Update(double inX, double inY, uint64_t nowQpc, uint64_t qpcFreq,
@@ -521,10 +528,180 @@ private:
     double m_velocityMag = 0.0;
     double m_prevSpeed = 0.0;
     int    m_warmupTicks = 10;
+    bool   m_activeLead = false;
     uint64_t m_lastQpc = 0;
 };
 
-using KinematicExtrapolator = AdaptiveFilterPipeline;
+struct ExtrapolationConfig {
+    bool enabled = false;
+    double tau_ms = 2.5;
+};
+
+class KinematicExtrapolator {
+public:
+    void Reset() noexcept {
+        m_hasPos = false;
+        m_hasVel = false;
+        m_activeLead = false;
+        m_lastX = 0.0;
+        m_lastY = 0.0;
+        m_lastVx = 0.0;
+        m_lastVy = 0.0;
+        m_lastQpc = 0;
+    }
+
+    [[nodiscard]] bool HasActiveLead() const noexcept {
+        return m_activeLead;
+    }
+
+    void UpdateWithDt(double inX, double inY, double dt_ms, const ExtrapolationConfig& cfg,
+                      double& outX, double& outY) noexcept {
+        if (!cfg.enabled || cfg.tau_ms <= 0.0) {
+            outX = inX;
+            outY = inY;
+            Reset();
+            return;
+        }
+
+        const double tau = (std::clamp)(cfg.tau_ms, 1.0, 5.0);
+
+        if (m_hasPos && dt_ms >= 0.0 && dt_ms < 0.1) {
+            m_lastX = inX;
+            m_lastY = inY;
+            if (m_hasVel && m_activeLead) {
+                outX = inX + m_lastVx * tau;
+                outY = inY + m_lastVy * tau;
+            } else {
+                outX = inX;
+                outY = inY;
+            }
+            return;
+        }
+
+        if (!m_hasPos || dt_ms < 0.1 || dt_ms > 40.0) {
+            m_hasPos = true;
+            m_hasVel = false;
+            m_activeLead = false;
+            m_lastX = inX;
+            m_lastY = inY;
+            m_lastVx = 0.0;
+            m_lastVy = 0.0;
+            outX = inX;
+            outY = inY;
+            return;
+        }
+
+        const double invDt = 1.0 / dt_ms;
+        const double vx = (inX - m_lastX) * invDt;
+        const double vy = (inY - m_lastY) * invDt;
+        const double curSpeedSq = vx * vx + vy * vy;
+
+        constexpr double NOISE_SPEED_SQ = 0.0025; // speed < 0.05
+        if (curSpeedSq < NOISE_SPEED_SQ) {
+            m_lastX = inX;
+            m_lastY = inY;
+            m_lastVx = 0.0;
+            m_lastVy = 0.0;
+            m_hasVel = true;
+            m_activeLead = false;
+            outX = inX;
+            outY = inY;
+            return;
+        }
+
+        if (!m_hasVel) {
+            m_hasVel = true;
+            m_activeLead = true;
+            m_lastX = inX;
+            m_lastY = inY;
+            m_lastVx = vx;
+            m_lastVy = vy;
+            outX = inX + vx * tau;
+            outY = inY + vy * tau;
+            return;
+        }
+
+        // Overshoot & Turnaround suppression:
+        // 1. Sharp turnaround: dot product of current and previous velocity < 0
+        const double prevSpeedSq = m_lastVx * m_lastVx + m_lastVy * m_lastVy;
+        const double dot = vx * m_lastVx + vy * m_lastVy;
+        bool suppress = (prevSpeedSq >= NOISE_SPEED_SQ && dot < 0.0);
+
+        // 2. Sharp braking / deceleration:
+        const double ax = (vx - m_lastVx) * invDt;
+        const double ay = (vy - m_lastVy) * invDt;
+        const double vprojX = vx + ax * tau;
+        const double vprojY = vy + ay * tau;
+        const double projDot = vprojX * vx + vprojY * vy;
+
+        if (projDot <= 0.0 || (curSpeedSq < 0.12 * prevSpeedSq && prevSpeedSq > 0.25)) {
+            suppress = true;
+        }
+
+        double leadX = 0.0;
+        double leadY = 0.0;
+        if (!suppress) {
+            leadX = vx * tau + 0.5 * ax * tau * tau;
+            leadY = vy * tau + 0.5 * ay * tau * tau;
+
+            const double accelDotVel = ax * vx + ay * vy;
+            if (accelDotVel < 0.0 && curSpeedSq > 1e-12) {
+                const double brakingGain = (std::clamp)(projDot / curSpeedSq, 0.0, 1.0);
+                leadX *= brakingGain;
+                leadY *= brakingGain;
+            }
+
+            const double leadDotVel = leadX * vx + leadY * vy;
+            if (leadDotVel <= 0.0) {
+                leadX = 0.0;
+                leadY = 0.0;
+            } else {
+                const double maxLeadSq = (2.25 * tau * tau) * curSpeedSq;
+                const double leadMagSq = leadX * leadX + leadY * leadY;
+                if (leadMagSq > maxLeadSq && leadMagSq > 1e-12) [[unlikely]] {
+                    const double scale = std::sqrt(maxLeadSq / leadMagSq);
+                    leadX *= scale;
+                    leadY *= scale;
+                }
+            }
+        }
+
+        m_lastX = inX;
+        m_lastY = inY;
+        m_lastVx = vx;
+        m_lastVy = vy;
+        m_activeLead = (leadX != 0.0 || leadY != 0.0);
+
+        outX = inX + leadX;
+        outY = inY + leadY;
+    }
+
+    void Update(double inX, double inY, uint64_t nowQpc, uint64_t qpcFreq,
+                const ExtrapolationConfig& cfg, double& outX, double& outY) noexcept {
+        double dt_ms = 0.0;
+        if (qpcFreq > 0 && m_lastQpc > 0 && nowQpc > m_lastQpc) {
+            if (g_qpcToUs > 0.0) {
+                dt_ms = static_cast<double>(nowQpc - m_lastQpc) * g_qpcToUs * 0.001;
+            } else {
+                dt_ms = static_cast<double>(nowQpc - m_lastQpc) * 1000.0 / static_cast<double>(qpcFreq);
+            }
+        }
+        if (!m_hasPos || dt_ms >= 0.1 || m_lastQpc == 0 || nowQpc < m_lastQpc) {
+            m_lastQpc = nowQpc;
+        }
+        UpdateWithDt(inX, inY, dt_ms, cfg, outX, outY);
+    }
+
+private:
+    bool m_hasPos = false;
+    bool m_hasVel = false;
+    bool m_activeLead = false;
+    double m_lastX = 0.0;
+    double m_lastY = 0.0;
+    double m_lastVx = 0.0;
+    double m_lastVy = 0.0;
+    uint64_t m_lastQpc = 0;
+};
 
 // --- Core Driver Configuration ---
 extern TabletSpec g_spec;
@@ -608,4 +785,3 @@ inline void CheckPointJitIpcUpdates() noexcept {}
 inline bool IsPointJitActive() noexcept { return false; }
 inline double GetPointJitLastNs() noexcept { return 0.0; }
 inline uint32_t GetPointJitCodeSize() noexcept { return 0; }
-

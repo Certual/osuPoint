@@ -94,13 +94,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ (github.event_name == 'workflow_dispatch' && inputs.tag_name != '') && inputs.tag_name || github.ref_name }}
-          name: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_title != '') && inputs.release_title || github.ref_name }}
+          name: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_title != '') && inputs.release_title || ((github.event_name == 'workflow_dispatch' && inputs.tag_name != '') && inputs.tag_name || github.ref_name) }}
           files: |
             osuPoint-sse.zip
             osuPoint-avx.zip
             osuPoint-avx2.zip
           draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
           prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || (contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc')) }}
-          generate_release_notes: true
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
